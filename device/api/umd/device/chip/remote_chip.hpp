@@ -44,6 +44,7 @@ public:
     void set_remote_transfer_ethernet_cores(const std::set<uint32_t>& channels) override;
     int get_num_host_channels() override;
     int get_host_channel_size(std::uint32_t channel) override;
+    std::uint64_t get_host_channel_stride(std::uint32_t channel) override;
     void write_to_sysmem(uint16_t channel, const void* src, uint64_t sysmem_dest, uint32_t size) override;
     void read_from_sysmem(uint16_t channel, void* dest, uint64_t sysmem_src, uint32_t size) override;
 

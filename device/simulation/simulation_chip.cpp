@@ -111,6 +111,10 @@ int SimulationChip::get_host_channel_size(std::uint32_t channel) {
     throw std::runtime_error("There are no host channels available.");
 }
 
+std::uint64_t SimulationChip::get_host_channel_stride(std::uint32_t channel) {
+    throw std::runtime_error("There are no host channels available.");
+}
+
 void SimulationChip::write_to_sysmem(uint16_t channel, const void* src, uint64_t sysmem_dest, uint32_t size) {
     throw std::runtime_error("SimulationChip::write_to_sysmem is not available for this chip.");
 }

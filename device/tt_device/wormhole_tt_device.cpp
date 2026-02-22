@@ -16,6 +16,7 @@
 #include "umd/device/types/communication_protocol.hpp"
 #include "umd/device/types/wormhole_telemetry.hpp"
 #include "umd/device/types/xy_pair.hpp"
+#include "hugepage.hpp"
 #include "utils.hpp"
 
 extern bool umd_use_noc1;
@@ -106,8 +107,9 @@ void WormholeTTDevice::configure_iatu_region(size_t region, uint64_t target, siz
     uint32_t dest_bar_hi = (target >> 32) & 0xffffffff;
     std::uint32_t region_id_to_use = region;
 
-    // TODO: stop doing this.  It's related to HUGEPAGE_CHANNEL_3_SIZE_LIMIT.
-    if (region == 3) {
+    // TODO: stop doing this. It's related to HUGEPAGE_CHANNEL_3_SIZE_LIMIT.
+    // Only needed when channel 3 is truncated to 768MB.
+    if (region == 3 && region_size == HUGEPAGE_CHANNEL_3_SIZE_LIMIT) {
         region_id_to_use = 4;  // Hack use region 4 for channel 3..this ensures that we have a smaller chan 3 address
                                // space with the correct start offset
     }

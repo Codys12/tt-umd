@@ -7,6 +7,7 @@
 #include <sys/mman.h>  // for mmap, munmap
 #include <sys/stat.h>  // for fstat
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <tt-logger/tt-logger.hpp>
@@ -17,17 +18,27 @@
 
 namespace tt::umd {
 
-SysmemManager::SysmemManager(TLBManager *tlb_manager, uint32_t num_host_mem_channels) :
+SysmemManager::SysmemManager(
+    TLBManager* tlb_manager, uint32_t num_host_mem_channels, uint64_t host_mem_channel_size_bytes) :
     tlb_manager_(tlb_manager),
     tt_device_(tlb_manager_->get_tt_device()),
     pcie_base_(
         tlb_manager->get_tt_device()->get_arch() == tt::ARCH::WORMHOLE_B0
             ? 0x800000000
-            : (tlb_manager->get_tt_device()->get_arch() == tt::ARCH::BLACKHOLE ? 4ULL << 58 : 0)) {
+            : (tlb_manager->get_tt_device()->get_arch() == tt::ARCH::BLACKHOLE ? 4ULL << 58 : 0)),
+    host_mem_channel_size_bytes_(host_mem_channel_size_bytes),
+    host_mem_channel_stride_bytes_(
+        tlb_manager->get_tt_device()->get_pci_device()->is_iommu_enabled() ? host_mem_channel_size_bytes
+                                                                       : HUGEPAGE_REGION_SIZE) {
     TT_ASSERT(
         num_host_mem_channels <= 4,
         "Only 4 host memory channels are supported per device, but {} requested.",
         num_host_mem_channels);
+    TT_ASSERT(
+        host_mem_channel_size_bytes_ > 0 && host_mem_channel_size_bytes_ <= HUGEPAGE_REGION_SIZE,
+        "Host memory channel size must be in range [1, {}] bytes, but {} requested.",
+        HUGEPAGE_REGION_SIZE,
+        host_mem_channel_size_bytes_);
     if (tt_device_->get_pci_device()->is_iommu_enabled()) {
         init_iommu(num_host_mem_channels);
     } else {
@@ -291,15 +302,15 @@ bool SysmemManager::init_iommu(uint32_t num_fake_mem_channels) {
         return true;
     }
 
-    constexpr size_t carveout_size = HUGEPAGE_REGION_SIZE - HUGEPAGE_CHANNEL_3_SIZE_LIMIT;  // 1GB - 768MB = 256MB
-    const size_t size = num_fake_mem_channels * HUGEPAGE_REGION_SIZE;
+    const size_t channel_stride = host_mem_channel_stride_bytes_;
+    const size_t full_size = static_cast<size_t>(num_fake_mem_channels) * channel_stride;
     TTDevice *tt_device_ = tlb_manager_->get_tt_device();
 
-    // Caclulate the size of the mapping in order to avoid overlap with PCIE registers on WH.
     if (tt_device_->get_arch() == tt::ARCH::WORMHOLE_B0 && num_fake_mem_channels == 4) {
-        iommu_mapping_size = (num_fake_mem_channels == 4) ? (size - carveout_size) : size;
+        const size_t channel3_size = std::min(channel_stride, HUGEPAGE_CHANNEL_3_SIZE_LIMIT);
+        iommu_mapping_size = (3 * channel_stride) + channel3_size;
     } else {
-        iommu_mapping_size = size;
+        iommu_mapping_size = full_size;
     }
 
     log_info(LogUMD, "Initializing iommu for sysmem (size: {:#x}).", iommu_mapping_size);
@@ -309,12 +320,13 @@ bool SysmemManager::init_iommu(uint32_t num_fake_mem_channels) {
     }
 
     log_info(LogUMD, "Allocating sysmem without hugepages (size: {:#x}).", iommu_mapping_size);
-    iommu_mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+    iommu_mapping =
+        mmap(nullptr, iommu_mapping_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
 
     if (iommu_mapping == MAP_FAILED) {
         TT_THROW(
             "UMD: Failed to allocate memory for device/host shared buffer (size: {} errno: {}).",
-            size,
+            iommu_mapping_size,
             strerror(errno));
     }
 
@@ -322,10 +334,11 @@ bool SysmemManager::init_iommu(uint32_t num_fake_mem_channels) {
 
     // Support for more than 1GB host memory accessible per device, via channels.
     for (size_t ch = 0; ch < num_fake_mem_channels; ch++) {
-        uint8_t *fake_mapping = static_cast<uint8_t *>(iommu_mapping) + ch * HUGEPAGE_REGION_SIZE;
-        size_t actual_size = (tt_device_->get_arch() == tt::ARCH::WORMHOLE_B0 && ch == 3)
-                                 ? HUGEPAGE_CHANNEL_3_SIZE_LIMIT
-                                 : HUGEPAGE_REGION_SIZE;
+        uint8_t* fake_mapping = static_cast<uint8_t *>(iommu_mapping) + ch * channel_stride;
+        size_t actual_size = channel_stride;
+        if (tt_device_->get_arch() == tt::ARCH::WORMHOLE_B0 && ch == 3) {
+            actual_size = std::min(actual_size, HUGEPAGE_CHANNEL_3_SIZE_LIMIT);
+        }
         hugepage_mapping_per_channel[ch] = {fake_mapping, actual_size, 0};
     }
 
@@ -359,7 +372,7 @@ bool SysmemManager::pin_or_map_iommu() {
     log_info(LogUMD, "Mapped sysmem without hugepages to IOVA {:#x}; NOC address {:#x}", iova, *noc_address);
 
     for (size_t ch = 0; ch < hugepage_mapping_per_channel.size(); ch++) {
-        uint64_t device_io_address = iova + ch * HUGEPAGE_REGION_SIZE;
+        uint64_t device_io_address = iova + ch * host_mem_channel_stride_bytes_;
         hugepage_mapping_per_channel.at(ch).physical_address = device_io_address;
     }
 
@@ -374,6 +387,10 @@ HugepageMapping SysmemManager::get_hugepage_mapping(size_t channel) const {
     } else {
         return hugepage_mapping_per_channel[channel];
     }
+}
+
+uint64_t SysmemManager::get_host_channel_stride(size_t /*channel*/) const {
+    return host_mem_channel_stride_bytes_;
 }
 
 void SysmemManager::print_file_contents(std::string filename, std::string hint) {

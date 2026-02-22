@@ -21,7 +21,8 @@ TEST(ApiSysmemManager, BasicIO) {
         std::unique_ptr<TLBManager> tlb_manager = std::make_unique<TLBManager>(tt_device.get());
 
         // Initializes system memory with one channel.
-        std::unique_ptr<SysmemManager> sysmem = std::make_unique<SysmemManager>(tlb_manager.get(), 1);
+        std::unique_ptr<SysmemManager> sysmem = std::make_unique<SysmemManager>(
+            tlb_manager.get(), 1, HUGEPAGE_REGION_SIZE);
 
         sysmem->pin_or_map_sysmem_to_device();
 

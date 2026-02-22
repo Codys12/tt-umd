@@ -14,6 +14,7 @@
 #include "umd/device/tt_device/tt_device.hpp"
 #include "umd/device/types/blackhole_arc.hpp"
 #include "umd/device/types/blackhole_eth.hpp"
+#include <algorithm>
 
 extern bool umd_use_noc1;
 
@@ -25,7 +26,11 @@ static_assert(!std::is_abstract<LocalChip>(), "LocalChip must be non-abstract.")
 const uint64_t BH_4GB_TLB_SIZE = 4ULL * 1024 * 1024 * 1024;
 
 std::unique_ptr<LocalChip> LocalChip::create(
-    int physical_device_id, std::string sdesc_path, int num_host_mem_channels, IODeviceType device_type) {
+    int physical_device_id,
+    std::string sdesc_path,
+    int num_host_mem_channels,
+    IODeviceType device_type,
+    uint64_t host_mem_channel_size_bytes) {
     // Create TTDevice and make sure the arc is ready so we can read its telemetry.
     auto tt_device = TTDevice::create(physical_device_id, device_type);
     tt_device->init_tt_device();
@@ -46,7 +51,8 @@ std::unique_ptr<LocalChip> LocalChip::create(
     // JTAG(currently the only communication protocol other than PCIe) has no use of them.
     if (device_type == IODeviceType::PCIe) {
         tlb_manager = std::make_unique<TLBManager>(tt_device.get());
-        sysmem_manager = std::make_unique<SysmemManager>(tlb_manager.get(), num_host_mem_channels);
+        sysmem_manager =
+            std::make_unique<SysmemManager>(tlb_manager.get(), num_host_mem_channels, host_mem_channel_size_bytes);
     }
     // Note that the eth_coord is not important here since this is only used for eth broadcasting.
     remote_communication = RemoteCommunication::create_remote_communication(
@@ -64,7 +70,11 @@ std::unique_ptr<LocalChip> LocalChip::create(
 }
 
 std::unique_ptr<LocalChip> LocalChip::create(
-    int physical_device_id, SocDescriptor soc_descriptor, int num_host_mem_channels, IODeviceType device_type) {
+    int physical_device_id,
+    SocDescriptor soc_descriptor,
+    int num_host_mem_channels,
+    IODeviceType device_type,
+    uint64_t host_mem_channel_size_bytes) {
     // Create TTDevice and make sure the arc is ready so we can read its telemetry.
     // physical_device_id is not actually physical for JTAG devices here.
     // It represents the index within a vector of jlink devices discovered by JtagDevice.
@@ -79,7 +89,8 @@ std::unique_ptr<LocalChip> LocalChip::create(
     // JTAG(currently the only communication protocol other than PCIe) has no use of them.
     if (device_type == IODeviceType::PCIe) {
         tlb_manager = std::make_unique<TLBManager>(tt_device.get());
-        sysmem_manager = std::make_unique<SysmemManager>(tlb_manager.get(), num_host_mem_channels);
+        sysmem_manager =
+            std::make_unique<SysmemManager>(tlb_manager.get(), num_host_mem_channels, host_mem_channel_size_bytes);
     }
     // Note that the eth_coord is not important here since this is only used for eth broadcasting.
     remote_communication = RemoteCommunication::create_remote_communication(
@@ -234,6 +245,19 @@ int LocalChip::get_host_channel_size(std::uint32_t channel) {
     HugepageMapping hugepage_map = sysmem_manager_->get_hugepage_mapping(channel);
     TT_ASSERT(hugepage_map.mapping_size, "Host channel size can only be queried after the device has been started.");
     return hugepage_map.mapping_size;
+}
+
+std::uint64_t LocalChip::get_host_channel_stride(std::uint32_t channel) {
+    if (!sysmem_manager_) {
+        log_warning(
+            LogUMD,
+            "sysmem_manager was not initialized for {} communication protocol",
+            DeviceTypeToString.at(tt_device_->get_communication_device_type()));
+        return 0;
+    }
+
+    TT_ASSERT(channel < get_num_host_channels(), "Querying stride for a host channel that does not exist.");
+    return sysmem_manager_->get_host_channel_stride(channel);
 }
 
 void LocalChip::write_to_sysmem(uint16_t channel, const void* src, uint64_t sysmem_dest, uint32_t size) {
@@ -567,7 +591,7 @@ void LocalChip::init_pcie_iatus() {
             // TODO: stop doing this.  The intent was good, but it's not
             // documented and nothing takes advantage of it.
             if (channel == 3) {
-                region_size = HUGEPAGE_CHANNEL_3_SIZE_LIMIT;
+                region_size = std::min(region_size, HUGEPAGE_CHANNEL_3_SIZE_LIMIT);
             }
         }
         tt_device_->configure_iatu_region(channel, hugepage_map.physical_address, region_size);

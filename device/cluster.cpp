@@ -236,6 +236,7 @@ std::unique_ptr<Chip> Cluster::construct_chip_from_cluster(
     ClusterDescriptor* cluster_desc,
     SocDescriptor& soc_desc,
     int num_host_mem_channels,
+    uint64_t host_mem_channel_size_bytes,
     const std::filesystem::path& simulator_directory) {
     if (chip_type == ChipType::MOCK) {
         return std::make_unique<MockChip>(soc_desc);
@@ -256,7 +257,8 @@ std::unique_ptr<Chip> Cluster::construct_chip_from_cluster(
             (cluster_desc->get_chips_with_mmio().at(chip_id)),
             soc_desc,
             num_host_mem_channels,
-            cluster_desc->io_device_type);
+            cluster_desc->io_device_type,
+            host_mem_channel_size_bytes);
 
         if (cluster_desc->get_arch(chip_id) == tt::ARCH::WORMHOLE_B0) {
             // Remote transfer currently supported only for wormhole.
@@ -450,6 +452,7 @@ Cluster::Cluster(ClusterOptions options) {
                 cluster_desc.get(),
                 soc_desc,
                 options.num_host_mem_ch_per_mmio_device,
+                options.host_mem_channel_size_bytes,
                 options.simulator_directory));
     }
 
@@ -1008,6 +1011,10 @@ std::uint32_t Cluster::get_num_host_channels(std::uint32_t device_id) {
 
 std::uint32_t Cluster::get_host_channel_size(std::uint32_t device_id, std::uint32_t channel) {
     return chips_.at(device_id)->get_host_channel_size(channel);
+}
+
+std::uint64_t Cluster::get_host_channel_stride(std::uint32_t device_id, std::uint32_t channel) {
+    return chips_.at(device_id)->get_host_channel_stride(channel);
 }
 
 std::uint32_t Cluster::get_numa_node_for_pcie_device(std::uint32_t device_id) {

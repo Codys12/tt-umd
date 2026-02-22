@@ -18,7 +18,7 @@ static constexpr size_t HUGEPAGE_CHANNEL_3_SIZE_LIMIT = 768 * (1 << 20);
 
 class SysmemManager {
 public:
-    SysmemManager(TLBManager* tlb_manager, uint32_t num_host_mem_channels);
+    SysmemManager(TLBManager* tlb_manager, uint32_t num_host_mem_channels, uint64_t host_mem_channel_size_bytes);
     ~SysmemManager();
 
     void write_to_sysmem(uint16_t channel, const void* src, uint64_t sysmem_dest, uint32_t size);
@@ -39,6 +39,7 @@ public:
 
     size_t get_num_host_mem_channels() const;
     HugepageMapping get_hugepage_mapping(size_t channel) const;
+    uint64_t get_host_channel_stride(size_t channel) const;
 
     std::unique_ptr<SysmemBuffer> allocate_sysmem_buffer(size_t sysmem_buffer_size, const bool map_to_noc = false);
 
@@ -72,6 +73,8 @@ private:
     std::vector<HugepageMapping> hugepage_mapping_per_channel;
     void* iommu_mapping = nullptr;
     size_t iommu_mapping_size = 0;
+    const uint64_t host_mem_channel_size_bytes_;
+    const uint64_t host_mem_channel_stride_bytes_;
 
     std::unique_ptr<SysmemBuffer> sysmem_buffer_ = nullptr;
 };

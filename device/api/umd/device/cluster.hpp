@@ -60,6 +60,12 @@ struct ClusterOptions {
      */
     uint32_t num_host_mem_ch_per_mmio_device = 1;
     /**
+     * Size of each host memory channel.
+     *
+     * Note: this is only honored when IOMMU is enabled (hugepages are fixed-size).
+     */
+    uint64_t host_mem_channel_size_bytes = 1ULL << 30;  // 1GB
+    /**
      * If set to false, harvesting will be skipped for constructed soc descriptors.
      */
     bool perform_harvesting = true;
@@ -545,6 +551,14 @@ public:
     std::uint32_t get_host_channel_size(std::uint32_t device_id, std::uint32_t channel);
 
     /**
+     * Get stride between host memory channels in the device-visible address space.
+     *
+     * @param device_id Logical device id to target.
+     * @param channel Logical host channel to target.
+     */
+    std::uint64_t get_host_channel_stride(std::uint32_t device_id, std::uint32_t channel);
+
+    /**
      * Get absolute address corresponding to a zero based offset into a specific host memory channel for a specific
      * device.
      *
@@ -685,6 +699,7 @@ private:
         ClusterDescriptor* cluster_desc,
         SocDescriptor& soc_desc,
         int num_host_mem_channels,
+        uint64_t host_mem_channel_size_bytes,
         const std::filesystem::path& simulator_directory);
     SocDescriptor construct_soc_descriptor(
         const std::string& soc_desc_path,

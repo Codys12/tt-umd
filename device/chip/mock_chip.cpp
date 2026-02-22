@@ -26,6 +26,8 @@ int MockChip::get_num_host_channels() { return 0; }
 
 int MockChip::get_host_channel_size(std::uint32_t channel) { return 0; }
 
+std::uint64_t MockChip::get_host_channel_stride(std::uint32_t channel) { return 0; }
+
 void MockChip::write_to_sysmem(uint16_t channel, const void* src, uint64_t sysmem_dest, uint32_t size) {}
 
 void MockChip::read_from_sysmem(uint16_t channel, void* dest, uint64_t sysmem_src, uint32_t size) {}
