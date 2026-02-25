@@ -14,3 +14,4 @@ __pycache__
 tt_umd.egg-info
 .venv
 ucli.key
+build_lite_restore
