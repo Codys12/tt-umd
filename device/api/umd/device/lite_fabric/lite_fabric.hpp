@@ -221,6 +221,21 @@ struct HostToLiteFabricInterface {
         do_barrier(barrier_coord, "ethernet", eth_barrier_addr);
     }
 
+    // Block until the device has consumed all pending writes (d2h.fabric_sender_channel_index
+    // catches up to h2d.sender_host_write_index).  Used to implement a non-MMIO flush/barrier:
+    // callers can guarantee that all prior writes have been committed to the remote chip before
+    // this function returns.
+    void wait_for_all_writes_consumed(CoreCoord translated_core_sender) {
+        uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
+        do {
+            tt_device->read_from_device(
+                (void*)(reinterpret_cast<uintptr_t>(this) + offset),
+                translated_core_sender,
+                host_interface_on_device_addr + offset,
+                sizeof(DeviceToHost));
+        } while (d2h.fabric_sender_channel_index != h2d.sender_host_write_index);
+    }
+
 private:
     constexpr uint32_t get_max_payload_data_size_bytes() const {
         // Additional 64B to be used only for unaligned reads/writes.

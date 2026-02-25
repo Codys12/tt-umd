@@ -39,7 +39,14 @@ void RemoteCommunicationLiteFabric::write_to_non_mmio(
 }
 
 void RemoteCommunicationLiteFabric::wait_for_non_mmio_flush(const std::chrono::milliseconds timeout_ms) {
-    // TODO(pjanevski): implement this.
+    // Block until the lite fabric sender channel on the MMIO ERISC1 has consumed all pending
+    // write descriptors that the host has submitted.  This ensures that all prior
+    // write_to_non_mmio() calls have been committed to the remote chip's L1/DRAM before
+    // this function returns, providing the barrier semantics needed by l1_membar /
+    // dram_membar on remote Blackhole chips.
+    tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
+    CoreCoord core_coord = CoreCoord(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
+    host_interface.wait_for_all_writes_consumed(core_coord);
 }
 
 }  // namespace tt::umd

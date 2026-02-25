@@ -24,6 +24,22 @@ if(TT_UMD_BUILD_SIMULATION)
     )
 endif()
 
+# Generate lite_fabric.embed (C hex-array include) from the pre-built lite_fabric.bin binary.
+# The generated file is placed in the CMake binary directory which is already on the
+# private include path for the device target.
+set(LITE_FABRIC_BIN "${CMAKE_CURRENT_SOURCE_DIR}/libs/lite_fabric.bin")
+set(LITE_FABRIC_EMBED "${CMAKE_CURRENT_BINARY_DIR}/lite_fabric.embed")
+add_custom_command(
+    OUTPUT "${LITE_FABRIC_EMBED}"
+    COMMAND
+        python3 -c
+        "import sys; data=open('${LITE_FABRIC_BIN}','rb').read(); lines=[', '.join('0x{:02x}'.format(b) for b in data[i:i+12]) for i in range(0,len(data),12)]; open('${LITE_FABRIC_EMBED}','w').write(',\n  '.join(lines)+'\n')"
+    DEPENDS "${LITE_FABRIC_BIN}"
+    COMMENT "Generating lite_fabric.embed from lite_fabric.bin"
+    VERBATIM
+)
+add_custom_target(lite_fabric_embed DEPENDS "${LITE_FABRIC_EMBED}")
+
 if(TT_UMD_BUILD_STATIC)
     add_library(device STATIC)
     message(STATUS "Building device library as STATIC")
@@ -32,6 +48,7 @@ else()
     message(STATUS "Building device library as SHARED")
 endif()
 add_library(${PROJECT_NAME}::device ALIAS device)
+add_dependencies(device lite_fabric_embed)
 
 # Enable unity builds for faster compilation 
 # Note: Requires TT_ENABLE_UNITY_BUILD function from parent project 
@@ -41,6 +58,7 @@ if(COMMAND TT_ENABLE_UNITY_BUILD)
     set_source_files_properties(
         arch/wormhole_implementation.cpp
         arch/blackhole_implementation.cpp
+        lite_fabric/lite_fabric_host_utils.cpp
         PROPERTIES
             SKIP_UNITY_BUILD_INCLUSION
                 ON
@@ -72,6 +90,7 @@ target_sources(
         types/tlb.cpp
         cluster_descriptor.cpp
         tt_device/blackhole_tt_device.cpp
+        tt_device/remote_blackhole_tt_device.cpp
         tt_device/tt_device.cpp
         tt_device/wormhole_tt_device.cpp
         tt_device/remote_wormhole_tt_device.cpp
@@ -104,6 +123,8 @@ target_sources(
         topology/topology_discovery_wormhole.cpp
         tt_device/remote_communication.cpp
         tt_device/remote_communication_legacy_firmware.cpp
+        tt_device/remote_communication_lite_fabric.cpp
+        lite_fabric/lite_fabric_host_utils.cpp
         jtag/jtag_device.cpp
         jtag/jtag.cpp
         tt_kmd_lib/tt_kmd_lib.c
@@ -162,6 +183,7 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
                 api/umd/device/cluster_descriptor.hpp
                 api/umd/device/types/core_coordinates.hpp
                 api/umd/device/tt_device/blackhole_tt_device.hpp
+                api/umd/device/tt_device/remote_blackhole_tt_device.hpp
                 api/umd/device/tt_device/tt_device.hpp
                 api/umd/device/tt_device/wormhole_tt_device.hpp
                 api/umd/device/tt_device/remote_wormhole_tt_device.hpp
@@ -169,6 +191,13 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)
                 api/umd/device/tt_device/tt_sim_tt_device.hpp
                 api/umd/device/tt_device/remote_communication.hpp
                 api/umd/device/tt_device/remote_communication_legacy_firmware.hpp
+                api/umd/device/tt_device/remote_communication_lite_fabric.hpp
+                api/umd/device/lite_fabric/lite_fabric.hpp
+                api/umd/device/lite_fabric/fabric_edm_types.hpp
+                api/umd/device/lite_fabric/lf_dev_mem_map.hpp
+                api/umd/device/lite_fabric/lite_fabric_constants.hpp
+                api/umd/device/lite_fabric/lite_fabric_header.hpp
+                api/umd/device/lite_fabric/lite_fabric_host_utils.hpp
                 api/umd/device/firmware/firmware_info_provider.hpp
                 api/umd/device/firmware/wormhole_18_3_firmware_info_provider.hpp
                 api/umd/device/firmware/wormhole_18_7_firmware_info_provider.hpp

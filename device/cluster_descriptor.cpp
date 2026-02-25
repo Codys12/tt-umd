@@ -291,6 +291,44 @@ ChipId ClusterDescriptor::get_closest_mmio_capable_chip(const ChipId chip) {
         return closest_mmio_chip_cache[chip];
     }
 
+    // If this chip has no ETH coordinate (e.g. remote BH chip discovered via ETH
+    // on a topology that doesn't use EthCoords), find the gateway MMIO chip
+    // through ethernet_connections or ethernet_connections_to_remote_devices.
+    if (chip_locations.find(chip) == chip_locations.end()) {
+        // First, check ethernet_connections (used when the remote chip is a
+        // discovered target device, e.g. BH P150 peer-to-peer).
+        auto eth_it = ethernet_connections.find(chip);
+        if (eth_it != ethernet_connections.end()) {
+            for (const auto& [chan, chip_and_chan] : eth_it->second) {
+                ChipId connected_chip = std::get<0>(chip_and_chan);
+                if (is_chip_mmio_capable(connected_chip)) {
+                    closest_mmio_chip_cache[chip] = connected_chip;
+                    return connected_chip;
+                }
+            }
+        }
+        // Second, check ethernet_connections_to_remote_devices (used when the
+        // remote chip is outside the local UMD cluster).
+        auto unique_id_it = chip_unique_ids.find(chip);
+        if (unique_id_it != chip_unique_ids.end()) {
+            uint64_t chip_board_id = unique_id_it->second;
+            for (const auto& [mmio_chip, remote_conns] : ethernet_connections_to_remote_devices) {
+                for (const auto& [chan, remote_info] : remote_conns) {
+                    if (std::get<0>(remote_info) == chip_board_id) {
+                        closest_mmio_chip_cache[chip] = mmio_chip;
+                        return mmio_chip;
+                    }
+                }
+            }
+        }
+        // Fallback: return first MMIO chip.
+        if (!chips_with_mmio.empty()) {
+            closest_mmio_chip_cache[chip] = chips_with_mmio.begin()->first;
+            return chips_with_mmio.begin()->first;
+        }
+        return chip;
+    }
+
     int min_distance = std::numeric_limits<int>::max();
     ChipId closest_chip = chip;
     EthCoord chip_eth_coord = this->chip_locations.at(chip);
@@ -927,9 +965,12 @@ void ClusterDescriptor::fill_chips_grouped_by_closest_mmio() {
             this->chips_grouped_by_closest_mmio[chip].insert(chip);
             continue;
         }
-        // TODO: This is to handle the case when we are not using ETH coordinates and have remote chip.
-        // Obviously, we have to figure out how to handle these cases in general in the future.
+        // When chip_locations is empty (e.g. Blackhole without EthCoords), use
+        // fallback logic in get_closest_mmio_capable_chip() to find the gateway
+        // MMIO chip via ethernet_connections.
         if (this->chip_locations.empty()) {
+            ChipId closest_mmio_chip = get_closest_mmio_capable_chip(chip);
+            this->chips_grouped_by_closest_mmio[closest_mmio_chip].insert(chip);
             continue;
         }
         ChipId closest_mmio_chip = get_closest_mmio_capable_chip(chip);

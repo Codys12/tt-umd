@@ -466,11 +466,47 @@ void Cluster::configure_active_ethernet_cores_for_mmio_device(
     // and set the active ethernet cores for them.
     for (const auto& remote_chip_id : remote_chip_ids_) {
         if (cluster_desc->get_closest_mmio_capable_chip(remote_chip_id) == mmio_chip) {
+            // For Blackhole remote chips, the remote transfer ETH core is bound to the specific
+            // trained link channel established during topology discovery and lite fabric init.
+            // Do not overwrite it with the generic active ETH core set, which may contain
+            // channels that do not have a physical link to this particular remote chip.
+            if (cluster_desc->get_arch(remote_chip_id) == tt::ARCH::BLACKHOLE) {
+                continue;
+            }
             get_remote_chip(remote_chip_id)->set_remote_transfer_ethernet_cores(active_eth_cores_per_chip);
         }
     }
     // Local chips hold communication primitives for broadcasting, so we have to set this up for them as well.
     get_local_chip(mmio_chip)->set_remote_transfer_ethernet_cores(active_eth_cores_per_chip);
+}
+
+void Cluster::upgrade_remote_bh_chip_info(ChipId chip_id) {
+    if (remote_chip_ids_.find(chip_id) == remote_chip_ids_.end()) {
+        return;  // Not a remote chip.
+    }
+    if (cluster_desc->get_arch(chip_id) != tt::ARCH::BLACKHOLE) {
+        return;  // Only applicable to Blackhole remote chips.
+    }
+
+    RemoteChip* remote_chip = get_remote_chip(chip_id);
+    remote_chip->upgrade_remote_chip_info_after_lite_fabric();
+
+    // Refresh the ClusterDescriptor entries with the corrected chip info now that the
+    // real FirmwareInfoProvider has been installed.
+    const ChipInfo& info = remote_chip->get_chip_info();
+    cluster_desc->harvesting_masks_map[chip_id] = info.harvesting_masks;
+    cluster_desc->noc_translation_enabled[chip_id] = info.noc_translation_enabled;
+    cluster_desc->chip_board_type[chip_id] = info.board_type;
+    cluster_desc->asic_locations[chip_id] = info.asic_location;
+
+    log_info(
+        LogUMD,
+        "Remote chip {} lite fabric upgrade complete: board_id {:#x}, harvesting tensix {:#x} dram {:#x} eth {:#x}",
+        chip_id,
+        info.board_id,
+        info.harvesting_masks.tensix_harvesting_mask,
+        info.harvesting_masks.dram_harvesting_mask,
+        info.harvesting_masks.eth_harvesting_mask);
 }
 
 std::set<ChipId> Cluster::get_target_device_ids() { return all_chip_ids_; }

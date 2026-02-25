@@ -186,7 +186,13 @@ uint32_t TopologyDiscoveryBlackhole::get_logical_remote_eth_channel(Chip* chip, 
 bool TopologyDiscoveryBlackhole::is_using_eth_coords() { return false; }
 
 bool TopologyDiscoveryBlackhole::is_board_id_included(uint64_t board_id, uint64_t board_type) const {
-    return board_ids.find(board_id) != board_ids.end();
+    // On 6U, board IDs are hacked to be ASIC IDs for per-chip filtering, so preserve the check.
+    // On non-6U Blackhole (e.g. P150 peer-to-peer via ETH), accept any remote chip visible on ETH
+    // regardless of board ID -- different standalone boards will always have different board IDs.
+    if (is_running_on_6u) {
+        return board_ids.find(board_id) != board_ids.end();
+    }
+    return true;
 }
 
 uint64_t TopologyDiscoveryBlackhole::mangle_asic_id(uint64_t board_id, uint8_t asic_location) {

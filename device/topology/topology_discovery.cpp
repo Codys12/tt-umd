@@ -148,6 +148,13 @@ void TopologyDiscovery::discover_remote_chips() {
             continue;
         }
 
+        // For remote (non-MMIO) Blackhole chips, lite fabric is not yet running so we cannot
+        // read ETH core registers to do further topology discovery from them.  They were
+        // created solely so they get a chip_id in the cluster descriptor; skip the ETH scan.
+        if (chip->get_tt_device()->get_arch() == ARCH::BLACKHOLE && !chip->is_mmio_capable()) {
+            continue;
+        }
+
         std::vector<CoreCoord> eth_cores =
             chip->get_soc_descriptor().get_cores(CoreType::ETH, umd_use_noc1 ? CoordSystem::NOC1 : CoordSystem::NOC0);
         TTDevice* tt_device = chip->get_tt_device();
@@ -185,9 +192,7 @@ void TopologyDiscovery::discover_remote_chips() {
             }
             active_eth_channels_per_chip.at(current_chip_asic_id).insert(channel);
 
-            if (!is_board_id_included(get_remote_board_id(chip, eth_core), get_remote_board_type(chip, eth_core)) ||
-                (chip->get_tt_device()->get_arch() == ARCH::BLACKHOLE &&
-                 discovered_chips.find(get_remote_asic_id(chip, eth_core)) == discovered_chips.end())) {
+            if (!is_board_id_included(get_remote_board_id(chip, eth_core), get_remote_board_type(chip, eth_core))) {
                 uint64_t remote_asic_id = get_remote_asic_id(chip, eth_core);
                 ethernet_connections_to_remote_devices.push_back(
                     {{current_chip_asic_id, channel},
@@ -207,11 +212,29 @@ void TopologyDiscovery::discover_remote_chips() {
                     eth_coord, chips.at(gateway_chip_id).get(), active_eth_channels_per_chip.at(gateway_chip_id));
 
                 chips_to_discover.emplace(remote_asic_id, std::move(remote_chip));
-                active_eth_channels_per_chip.emplace(remote_asic_id, std::set<uint32_t>());
+                // For Blackhole remote chips, do NOT add an entry to active_eth_channels_per_chip.
+                // Lite fabric owns both ERISC0 and ERISC1 on the tunnel channel; metal must not
+                // write its own ETH FW init data to any ETH core on the remote chip.  By omitting
+                // the entry here, fill_cluster_descriptor_info will leave both idle_eth_channels
+                // and active_eth_channels empty for this chip, so initialize_and_launch_firmware
+                // will skip all ETH FW operations on it.
+                // For non-Blackhole (e.g., Wormhole) remote chips, the entry IS needed because the
+                // remote chip will be ETH-scanned in the next iteration of the discover loop.
+                if (chip->get_tt_device()->get_arch() != ARCH::BLACKHOLE) {
+                    active_eth_channels_per_chip.emplace(remote_asic_id, std::set<uint32_t>());
+                }
                 discovered_chips.insert(remote_asic_id);
                 remote_asic_id_to_mmio_chip_id.emplace(remote_asic_id, gateway_chip_id);
                 if (is_using_eth_coords()) {
                     eth_coords.emplace(remote_asic_id, eth_coord.value());
+                }
+                // For Blackhole we skip the remote chip's own ETH scan (lite fabric is not yet running),
+                // so the reverse connection will never be added from the remote side.  Record it here so
+                // the cluster descriptor contains the link and lite fabric can find the tunnel.
+                if (chip->get_tt_device()->get_arch() == ARCH::BLACKHOLE) {
+                    uint32_t remote_channel = get_remote_eth_channel(chip, eth_core);
+                    ethernet_connections.push_back(
+                        {{current_chip_asic_id, channel}, {remote_asic_id, remote_channel}});
                 }
             } else {
                 ethernet_connections.push_back(

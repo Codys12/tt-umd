@@ -283,7 +283,7 @@ public:
 
     bool is_remote();
 
-    void init_tt_device(const std::chrono::milliseconds timeout_ms = timeout::ARC_STARTUP_TIMEOUT);
+    virtual void init_tt_device(const std::chrono::milliseconds timeout_ms = timeout::ARC_STARTUP_TIMEOUT);
 
     uint64_t get_refclk_counter();
 

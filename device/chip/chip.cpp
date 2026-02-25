@@ -230,6 +230,10 @@ void Chip::set_power_state(DevicePowerState state) {
         uint32_t msg = get_power_state_arc_msg(state);
         exit_code = arc_msg(wormhole::ARC_MSG_COMMON_PREFIX | msg, true, {0, 0});
     } else if (soc_descriptor_.arch == tt::ARCH::BLACKHOLE) {
+        if (get_tt_device()->get_arc_messenger() == nullptr) {
+            // Remote BH chip before lite fabric is running; ARC is not reachable.
+            return;
+        }
         if (state == DevicePowerState::BUSY) {
             exit_code =
                 get_tt_device()->get_arc_messenger()->send_message((uint32_t)blackhole::ArcMessageType::AICLK_GO_BUSY);

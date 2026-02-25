@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <thread>
 #include <tt-logger/tt-logger.hpp>
 
 #include "umd/device/chip/chip.hpp"
@@ -67,7 +68,7 @@ void wait_for_state(
     CoreCoord eth_core,
     uint32_t addr,
     uint32_t state,
-    std::chrono::milliseconds timeout_ms = timeout::BH_LITE_FABRIC_STATE_CHANGE_TIMEOUT) {
+    std::chrono::milliseconds timeout_ms) {
     uint32_t readback = 0xDEADBEEF;
     auto start_time = std::chrono::steady_clock::now();
     while (readback != state) {

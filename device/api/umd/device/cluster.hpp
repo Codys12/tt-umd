@@ -232,6 +232,20 @@ public:
     void configure_active_ethernet_cores_for_mmio_device(
         ChipId mmio_chip, const std::unordered_set<CoreCoord>& active_eth_cores_per_chip);
 
+    /**
+     * For Blackhole remote chips: upgrade the chip's FirmwareInfoProvider from the proxy
+     * (borrowed from the local gateway during topology discovery, before lite fabric was up)
+     * to a real one that reads from the remote ARC via lite fabric.  Also refreshes the chip's
+     * SocDescriptor with the correct harvesting masks and re-runs DRAM training polls.
+     * Updates the ClusterDescriptor's harvesting_masks_map and noc_translation_enabled entries.
+     *
+     * Must be called after lite fabric is running (after InitializeLiteFabric).
+     * No-op for non-remote or non-Blackhole chips.
+     *
+     * @param chip_id Logical ID of the remote Blackhole chip to upgrade.
+     */
+    void upgrade_remote_bh_chip_info(ChipId chip_id);
+
     //---------- Start and stop the device and tensix cores.
 
     /**

@@ -36,6 +36,14 @@ public:
     void start_device() override;
     void close_device() override;
 
+    // For Blackhole remote chips: upgrade the FirmwareInfoProvider from the proxy (local
+    // gateway's provider, installed in init_tt_device before lite fabric was running) to a
+    // real one that reads from this chip's ARC via lite fabric.  Also refreshes chip_info_
+    // and soc_descriptor_ with the corrected harvesting masks and chip metadata, then
+    // re-runs wait_chip_to_be_ready() to poll actual DRAM training status.
+    // Must be called after lite fabric is running.  No-op for non-Blackhole chips.
+    void upgrade_remote_chip_info_after_lite_fabric();
+
     TTDevice* get_tt_device() override;
     SysmemManager* get_sysmem_manager() override;
     TLBManager* get_tlb_manager() override;
