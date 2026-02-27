@@ -5,6 +5,8 @@
  */
 #pragma once
 
+#include <map>
+
 #include "umd/device/chip/local_chip.hpp"
 #include "umd/device/tt_device/blackhole_tt_device.hpp"
 
@@ -69,6 +71,15 @@ private:
     // start of upgrade_firmware_info_provider() so that the ArcTelemetryReader
     // constructor can read through lite fabric.
     bool lite_fabric_running_ = false;
+
+    // Cache of per-core soft reset register values.  NOC reads to the Tensix
+    // soft reset register (0xFFB121B0) hang when the target core is in reset
+    // because its local bus does not respond.  Instead of reading through lite
+    // fabric (which would cause ERISC1's noc_async_read_barrier to hang
+    // forever), we track writes and return the cached value on reads.  Cores
+    // not in the cache are assumed to be in POR state (all RISCs in reset).
+    // Key: (core.x << 16) | core.y
+    std::map<uint32_t, uint32_t> soft_reset_reg_cache_;
 };
 
 }  // namespace tt::umd

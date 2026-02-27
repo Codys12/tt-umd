@@ -24,6 +24,20 @@ void RemoteBlackholeTTDevice::read_from_device(void* mem_ptr, tt_xy_pair core, u
         std::memset(mem_ptr, 0, size);
         return;
     }
+    // NOC reads to the Tensix soft reset register hang when the target core is
+    // in reset (its local bus does not respond), causing ERISC1's
+    // noc_async_read_barrier to block forever.  Return the cached value from
+    // our last write, or the POR default (all Tensix RISCs in reset) if we
+    // have never written to this core's register.
+    if (addr == blackhole::TENSIX_SOFT_RESET_ADDR && size == sizeof(uint32_t)) {
+        uint32_t key = (static_cast<uint32_t>(core.x) << 16) | static_cast<uint32_t>(core.y);
+        auto it = soft_reset_reg_cache_.find(key);
+        uint32_t val = (it != soft_reset_reg_cache_.end())
+                           ? it->second
+                           : architecture_impl_->get_soft_reset_reg_value(tt::umd::RiscType::ALL_TENSIX);
+        std::memcpy(mem_ptr, &val, sizeof(uint32_t));
+        return;
+    }
     remote_communication_->read_non_mmio(core, mem_ptr, addr, size);
 }
 
@@ -31,6 +45,14 @@ void RemoteBlackholeTTDevice::write_to_device(const void* mem_ptr, tt_xy_pair co
     if (!lite_fabric_running_) {
         // Lite fabric not yet running; writes are silently dropped.
         return;
+    }
+    // Track writes to the soft reset register so reads can return the cached
+    // value (see read_from_device comment above).
+    if (addr == blackhole::TENSIX_SOFT_RESET_ADDR && size == sizeof(uint32_t)) {
+        uint32_t key = (static_cast<uint32_t>(core.x) << 16) | static_cast<uint32_t>(core.y);
+        uint32_t val;
+        std::memcpy(&val, mem_ptr, sizeof(uint32_t));
+        soft_reset_reg_cache_[key] = val;
     }
     remote_communication_->write_to_non_mmio(core, mem_ptr, addr, size);
 }

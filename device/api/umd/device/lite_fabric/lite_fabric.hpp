@@ -137,6 +137,9 @@ static_assert(sizeof(LiteFabricConfig) % 16 == 0);
 static_assert(offsetof(LiteFabricConfig, primary_local_handshake) % 16 == 0);
 static_assert(offsetof(LiteFabricConfig, neighbour_handshake) % 16 == 0);
 
+// Deprecated: was a global static counter shared across all devices, which caused a race
+// condition when multiple remote devices performed concurrent reads (e.g. during parallel
+// build_and_init in Phase 3).  Each HostToLiteFabricInterface now has its own counter.
 class HostToLiteFabricReadEvent {
 private:
     inline static std::atomic<uint64_t> event{0};
@@ -168,17 +171,25 @@ struct HostToLiteFabricInterface {
     uint32_t eth_barrier_addr = 0;
     uint32_t tensix_barrier_addr = 0;
     uint32_t l1_alignment_bytes = 0;
+    // Address of LiteFabricConfig on device, for diagnostic readback.
+    uint32_t config_on_device_addr = 0;
     // The core to process requests.
     uint32_t mmio_device_id = 0;
     uint32_t mmio_eth_core_x = 0;
     uint32_t mmio_eth_core_y = 0;
     TTDevice* tt_device = nullptr;
 
+    // Per-instance read event counter.  Each HostToLiteFabricInterface (one per
+    // lite-fabric tunnel / remote device) tracks its own monotonic event ID so
+    // concurrent reads on different tunnels cannot interfere with each other.
+    uint64_t read_event_counter = 0;
+
     inline void init() volatile {
         h2d.sender_host_write_index = 0;
         h2d.receiver_host_read_index = 0;
         d2h.fabric_sender_channel_index = 0;
         d2h.fabric_receiver_channel_index = 0;
+        read_event_counter = 0;
     }
 
     void read(void* mem_ptr, size_t size, CoreCoord receiver_core, tt_xy_pair src_core, uint64_t src_addr) {
@@ -226,13 +237,109 @@ struct HostToLiteFabricInterface {
     // callers can guarantee that all prior writes have been committed to the remote chip before
     // this function returns.
     void wait_for_all_writes_consumed(CoreCoord translated_core_sender) {
+        static constexpr auto k_Timeout = std::chrono::seconds(10);
+        static constexpr auto k_WarnInterval = std::chrono::seconds(2);
         uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
+        auto start = std::chrono::steady_clock::now();
+        auto last_warn = start;
         do {
             tt_device->read_from_device(
                 (void*)(reinterpret_cast<uintptr_t>(this) + offset),
                 translated_core_sender,
                 host_interface_on_device_addr + offset,
                 sizeof(DeviceToHost));
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_warn > k_WarnInterval) {
+                last_warn = now;
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+
+                // Read the full host interface word from the device (d2h + h2d = 4 bytes)
+                // to verify whether the h2d flush actually landed on the device.
+                uint32_t dev_host_iface_word = 0;
+                tt_device->read_from_device(
+                    &dev_host_iface_word,
+                    translated_core_sender,
+                    host_interface_on_device_addr,
+                    sizeof(dev_host_iface_word));
+                uint8_t dev_d2h_sender = dev_host_iface_word & 0xFF;
+                uint8_t dev_d2h_receiver = (dev_host_iface_word >> 8) & 0xFF;
+                uint8_t dev_h2d_sender = (dev_host_iface_word >> 16) & 0xFF;
+                uint8_t dev_h2d_receiver = (dev_host_iface_word >> 24) & 0xFF;
+
+                // Read config: routing_enabled and current_state to check firmware health.
+                LiteFabricConfig dev_config{};
+                if (config_on_device_addr != 0) {
+                    tt_device->read_from_device(
+                        &dev_config,
+                        translated_core_sender,
+                        config_on_device_addr,
+                        sizeof(LiteFabricConfig));
+                }
+
+                // Decode firmware diagnostic from primary_local_handshake:
+                //   bits 31-24: num_free_slots (capped at 0xFF)
+                //   bits 23-16: raw completion stream register value (capped at 0xFF)
+                //   bit 8:      has_unsent_packet
+                //   bit 0:      can_send
+                uint32_t diag = dev_config.primary_local_handshake;
+                uint32_t fw_num_free_slots = (diag >> 24) & 0xFF;
+                uint32_t fw_completion_reg = (diag >> 16) & 0xFF;
+                uint32_t fw_has_unsent = (diag >> 8) & 0xFF;
+                uint32_t fw_can_send = diag & 0xFF;
+                uint32_t fw_loop_counter = dev_config.neighbour_handshake;
+
+                log_warning(
+                    LogUMD,
+                    "wait_for_all_writes_consumed: stuck {}ms on core ({},{}) "
+                    "host: d2h.sender={} h2d.sender={} | "
+                    "device: d2h.sender={} d2h.recv={} h2d.sender={} h2d.recv={} | "
+                    "config: routing_enabled={} current_state={} | "
+                    "fw_diag: num_free_slots={} completion_reg={} has_unsent={} can_send={} loop_cnt={}",
+                    elapsed.count(),
+                    translated_core_sender.x,
+                    translated_core_sender.y,
+                    d2h.fabric_sender_channel_index,
+                    h2d.sender_host_write_index,
+                    dev_d2h_sender,
+                    dev_d2h_receiver,
+                    dev_h2d_sender,
+                    dev_h2d_receiver,
+                    static_cast<uint32_t>(dev_config.routing_enabled),
+                    static_cast<uint32_t>(dev_config.current_state),
+                    fw_num_free_slots,
+                    fw_completion_reg,
+                    fw_has_unsent,
+                    fw_can_send,
+                    fw_loop_counter);
+                if (now - start > k_Timeout) {
+                    throw std::runtime_error(fmt::format(
+                        "Lite fabric wait_for_all_writes_consumed timed out after {}s on core ({},{}): "
+                        "host d2h.sender={} h2d.sender={}, "
+                        "device d2h.sender={} h2d.sender={}, "
+                        "routing_enabled={} current_state={}, "
+                        "fw: num_free_slots={} completion_reg={} has_unsent={} can_send={} loop_cnt={}. "
+                        "{}",
+                        k_Timeout.count(),
+                        translated_core_sender.x,
+                        translated_core_sender.y,
+                        d2h.fabric_sender_channel_index,
+                        h2d.sender_host_write_index,
+                        dev_d2h_sender,
+                        dev_h2d_sender,
+                        static_cast<uint32_t>(dev_config.routing_enabled),
+                        static_cast<uint32_t>(dev_config.current_state),
+                        fw_num_free_slots,
+                        fw_completion_reg,
+                        fw_has_unsent,
+                        fw_can_send,
+                        fw_loop_counter,
+                        fw_loop_counter == 0
+                            ? "Firmware never ran (loop_cnt=0)."
+                            : fw_num_free_slots == 0
+                                ? "Firmware alive but num_free_slots=0 — remote receiver completions not arriving."
+                                : "h2d flush reached device but firmware is not consuming — unknown cause."));
+                }
+            }
         } while (d2h.fabric_sender_channel_index != h2d.sender_host_write_index);
     }
 
@@ -253,21 +360,53 @@ private:
     }
 
     void wait_for_empty_write_slot(CoreCoord translated_core_sender) {
+        static constexpr auto k_Timeout = std::chrono::seconds(10);
+        static constexpr auto k_WarnInterval = std::chrono::seconds(2);
         uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
+        auto start = std::chrono::steady_clock::now();
+        auto last_warn = start;
         do {
             tt_device->read_from_device(
                 (void*)(reinterpret_cast<uintptr_t>(this) + offset),
                 translated_core_sender,
                 host_interface_on_device_addr + offset,
                 sizeof(DeviceToHost));
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_warn > k_WarnInterval) {
+                last_warn = now;
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+                log_warning(
+                    LogUMD,
+                    "wait_for_empty_write_slot: stuck {}ms on core ({},{}) "
+                    "d2h.sender_idx={} h2d.sender_idx={}",
+                    elapsed.count(),
+                    translated_core_sender.x,
+                    translated_core_sender.y,
+                    d2h.fabric_sender_channel_index,
+                    h2d.sender_host_write_index);
+                if (now - start > k_Timeout) {
+                    throw std::runtime_error(fmt::format(
+                        "Lite fabric wait_for_empty_write_slot timed out after {}s on core ({},{}): "
+                        "d2h.sender_idx={} h2d.sender_idx={}. "
+                        "The MMIO-side ERISC1 is not consuming writes.",
+                        k_Timeout.count(),
+                        translated_core_sender.x,
+                        translated_core_sender.y,
+                        d2h.fabric_sender_channel_index,
+                        h2d.sender_host_write_index));
+                }
+            }
         } while ((h2d.sender_host_write_index + 1) % NUM_BUFFERS == d2h.fabric_sender_channel_index);
     }
 
     void wait_for_read_event(CoreCoord translated_core_sender, uint32_t read_event_addr) {
+        static constexpr auto k_Timeout = std::chrono::seconds(10);
         tt_driver_atomics::mfence();
         volatile FabricLiteHeader header;
         header.command_fields.noc_read.event = 0;
-        const auto expectedOrderId = HostToLiteFabricReadEvent::get();
+        const auto expectedOrderId = read_event_counter;
+        auto start = std::chrono::steady_clock::now();
+        int poll_count = 0;
         while (true) {
             tt_device->read_from_device(
                 const_cast<void*>(static_cast<volatile void*>(&header)),
@@ -283,9 +422,53 @@ private:
                 throw std::runtime_error(fmt::format(
                     "Read event out of order: {} > {}", header.command_fields.noc_read.event, expectedOrderId));
             }
+            if (++poll_count % 10000 == 0 && std::chrono::steady_clock::now() - start > k_Timeout) {
+                // Diagnostic: read firmware state from MMIO ERISC1 via PCIe
+                std::string diag_str;
+                if (config_on_device_addr != 0) {
+                    LiteFabricConfig dev_config{};
+                    tt_device->read_from_device(
+                        &dev_config, translated_core_sender, config_on_device_addr, sizeof(LiteFabricConfig));
+                    // Decode sender diag from primary_local_handshake
+                    uint32_t sdiag = dev_config.primary_local_handshake;
+                    uint32_t fw_nfs = (sdiag >> 24) & 0xFF;
+                    uint32_t fw_comp = (sdiag >> 16) & 0xFF;
+                    uint32_t fw_unsent = (sdiag >> 8) & 0xFF;
+                    uint32_t fw_can = sdiag & 0xFF;
+                    // Decode receiver diag from padding1[0]
+                    uint32_t rdiag = dev_config.padding1[0];
+                    uint32_t recv_wr_sent = (rdiag >> 24) & 0xFF;
+                    uint32_t recv_comp = (rdiag >> 16) & 0xFF;
+                    uint32_t recv_d2h_idx = (rdiag >> 8) & 0xFF;
+                    uint32_t recv_h2d_idx = rdiag & 0xFF;
+                    uint32_t loop_cnt = dev_config.neighbour_handshake;
+                    diag_str = fmt::format(
+                        " FW: loop_cnt={} routing={} state={} | "
+                        "sender: nfs={} comp_reg={} unsent={} can={} | "
+                        "receiver: wr_sent={} comp={} d2h_idx={} h2d_idx={} | "
+                        "host: d2h.sender={} h2d.sender={} h2d.recv={}",
+                        loop_cnt,
+                        static_cast<uint32_t>(dev_config.routing_enabled),
+                        static_cast<uint32_t>(dev_config.current_state),
+                        fw_nfs, fw_comp, fw_unsent, fw_can,
+                        recv_wr_sent, recv_comp, recv_d2h_idx, recv_h2d_idx,
+                        d2h.fabric_sender_channel_index,
+                        h2d.sender_host_write_index,
+                        h2d.receiver_host_read_index);
+                }
+                throw std::runtime_error(fmt::format(
+                    "Lite fabric wait_for_read_event timed out after {}s on core ({},{}): "
+                    "expected event={} got event={:#x}.{}",
+                    k_Timeout.count(),
+                    translated_core_sender.x,
+                    translated_core_sender.y,
+                    expectedOrderId,
+                    header.command_fields.noc_read.event,
+                    diag_str));
+            }
         };
 
-        HostToLiteFabricReadEvent::increment();
+        ++read_event_counter;
     }
 
     void send_payload_flush_non_blocking_from_address(
@@ -296,8 +479,11 @@ private:
 
         uint32_t addr = get_next_send_buffer_slot_address(channel_address);
         header.debug = 0xcafe0000;
-        // Force all packets to be on NOC1 to avoid conflict with ERISC0 NOC0.
-        header.noc_send_type.fields.noc_index = 1;
+        // Use NOC0 because UMD encodes TRANSLATED coordinates which are NOC0 coordinates.
+        // NOC0 and NOC1 have mirrored coordinate systems on Blackhole, so using NOC1
+        // with NOC0 coordinates sends writes to the wrong physical cores.
+        // ERISC0 is held in reset on the remote chip, so NOC0 is safe for ERISC1 to use.
+        header.noc_send_type.fields.noc_index = 0;
 
         tt_device->write_to_device(&header, translated_core_sender, addr, sizeof(FabricLiteHeader));
 
@@ -347,6 +533,16 @@ private:
 
         header.unaligned_offset = dst_noc_addr & (l1_alignment_bytes - 1);
 
+        log_debug(
+            LogUMD,
+            "write_one_page: sender=({},{}) dst_noc={:#x} size={} h2d.sender_idx={} d2h.sender_idx={}",
+            sender_core.x,
+            sender_core.y,
+            dst_noc_addr,
+            size,
+            h2d.sender_host_write_index,
+            d2h.fabric_sender_channel_index);
+
         wait_for_empty_write_slot(sender_core);
 
         send_payload_without_header_non_blocking_from_address(
@@ -378,7 +574,7 @@ private:
     void read_one_page(void* mem_ptr, size_t size, CoreCoord receiver_core, uint64_t src_noc_addr) {
         FabricLiteHeader header;
         header.to_chip_unicast(1);
-        header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, HostToLiteFabricReadEvent::get()}, size);
+        header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event_counter}, size);
         header.unaligned_offset = 0;
 
         uint32_t receiver_header_address = get_next_receiver_buffer_slot_address(receiver_channel_base);
@@ -472,6 +668,8 @@ struct LiteFabricMemoryMap {
         host_interface.eth_barrier_addr = eth_barrier_addr;
         host_interface.tensix_barrier_addr = tensix_barrier_addr;
         host_interface.l1_alignment_bytes = l1_alignment_bytes;
+        host_interface.config_on_device_addr =
+            get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, config);
         host_interface.tt_device = tt_device;
 
         host_interface.init();
