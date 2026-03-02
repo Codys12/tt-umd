@@ -43,9 +43,25 @@ public:
 
     virtual void wait_for_non_mmio_flush(const std::chrono::milliseconds timeout_ms = timeout::NON_MMIO_RW_TIMEOUT) = 0;
 
+    // Write a register on the remote ETH tile via the Ethernet hardware's
+    // direct register-write command.  This bypasses the NOC and can access
+    // debug registers (0xFFBxxxxx) that are unreachable via NOC unicast writes.
+    // Default implementation falls back to write_to_non_mmio.
+    virtual void write_remote_reg(uint32_t reg_addr, uint32_t reg_value) {
+        write_to_non_mmio(tt_xy_pair(0, 0), &reg_value, reg_addr, sizeof(uint32_t));
+    }
+
+    // Write a register via a specific sender ETH core (in translated coords).
+    // WRITE_REG only reaches the ETH tile at the far end of the sender's
+    // ethernet link, so the caller must choose the sender core that connects
+    // to the target tile.
+    virtual void write_remote_reg(uint32_t reg_addr, uint32_t reg_value, tt_xy_pair sender_core) {
+        write_remote_reg(reg_addr, reg_value);
+    }
+
     // Set the ethernet cores which can be used for remote communication on the assigned local chip.
     // The cores should be in translated coordinates.
-    void set_remote_transfer_ethernet_cores(const std::unordered_set<tt_xy_pair>& cores);
+    virtual void set_remote_transfer_ethernet_cores(const std::unordered_set<tt_xy_pair>& cores);
 
     TTDevice* get_local_device();
 

@@ -159,6 +159,11 @@ struct HostToLiteFabricInterface {
         volatile uint8_t fabric_receiver_channel_index = 0;
     } __attribute((packed)) d2h;
 
+    // Padding to ensure d2h and h2d occupy separate 4-byte words.
+    // Without this, firmware byte writes to d2h (RISC-V SB → word-level
+    // RMW on L1) can clobber concurrent host writes to h2d in the same word.
+    uint8_t _d2h_h2d_pad[2]{};
+
     // These values are updated by the host and written to the device.
     struct HostToDevice {
         volatile uint8_t sender_host_write_index = 0;
@@ -200,6 +205,30 @@ struct HostToLiteFabricInterface {
     void write(void* mem_ptr, size_t size, CoreCoord sender_core, tt_xy_pair dst_core, uint64_t dst_addr) {
         uint64_t dst_noc_addr = (uint64_t(dst_core.y) << (36 + 6)) | (uint64_t(dst_core.x) << 36) | dst_addr;
         write_noc_addr(mem_ptr, size, sender_core, dst_noc_addr);
+    }
+
+    // Send a WRITE_REG command through the lite fabric.  The MMIO-side
+    // relay calls eth_write_remote_reg() which writes directly to the
+    // remote ETH tile's register space via the Ethernet hardware, bypassing
+    // the NOC.  This is required for writing to debug registers (0xFFBxxxxx)
+    // such as the soft reset register which are not reachable via NOC
+    // unicast writes.
+    void write_reg(uint32_t reg_addr, uint32_t reg_value, CoreCoord sender_core) {
+        FabricLiteHeader header;
+        header.to_chip_unicast(1);
+        header.to_write_reg(lite_fabric::WriteRegCommandHeader{reg_addr, reg_value});
+        header.payload_size_bytes = sizeof(FabricLiteHeader);
+        header.unaligned_offset = 0;
+        header.debug = 0xcafe0000;
+        header.noc_send_type.fields.noc_index = 0;
+
+        wait_for_empty_write_slot(sender_core);
+
+        uint32_t addr = get_next_send_buffer_slot_address(sender_channel_base);
+        tt_device->write_to_device(&header, sender_core, addr, sizeof(FabricLiteHeader));
+
+        h2d.sender_host_write_index = lite_fabric::wrap_increment<NUM_BUFFERS>(h2d.sender_host_write_index);
+        flush_h2d(sender_core);
     }
 
     void barrier(CoreCoord translated_core_sender) {
@@ -253,18 +282,24 @@ struct HostToLiteFabricInterface {
                 last_warn = now;
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
 
-                // Read the full host interface word from the device (d2h + h2d = 4 bytes)
-                // to verify whether the h2d flush actually landed on the device.
-                uint32_t dev_host_iface_word = 0;
+                // Read d2h and h2d from device separately (they are in different
+                // 4-byte words after padding was added between them).
+                uint32_t dev_d2h_word = 0;
                 tt_device->read_from_device(
-                    &dev_host_iface_word,
+                    &dev_d2h_word,
                     translated_core_sender,
-                    host_interface_on_device_addr,
-                    sizeof(dev_host_iface_word));
-                uint8_t dev_d2h_sender = dev_host_iface_word & 0xFF;
-                uint8_t dev_d2h_receiver = (dev_host_iface_word >> 8) & 0xFF;
-                uint8_t dev_h2d_sender = (dev_host_iface_word >> 16) & 0xFF;
-                uint8_t dev_h2d_receiver = (dev_host_iface_word >> 24) & 0xFF;
+                    host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, d2h),
+                    sizeof(uint32_t));
+                uint8_t dev_d2h_sender = dev_d2h_word & 0xFF;
+                uint8_t dev_d2h_receiver = (dev_d2h_word >> 8) & 0xFF;
+                uint32_t dev_h2d_word = 0;
+                tt_device->read_from_device(
+                    &dev_h2d_word,
+                    translated_core_sender,
+                    host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, h2d),
+                    sizeof(uint32_t));
+                uint8_t dev_h2d_sender = dev_h2d_word & 0xFF;
+                uint8_t dev_h2d_receiver = (dev_h2d_word >> 8) & 0xFF;
 
                 // Read config: routing_enabled and current_state to check firmware health.
                 LiteFabricConfig dev_config{};
