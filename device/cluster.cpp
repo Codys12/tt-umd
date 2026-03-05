@@ -340,6 +340,26 @@ void Cluster::add_chip(const ChipId& chip_id, const ChipType& chip_type, std::un
     chips_.emplace(chip_id, std::move(chip));
 }
 
+void Cluster::register_remote_chip(
+    ChipId chip_id,
+    ChipId gateway_id,
+    const std::set<uint32_t>& gateway_eth_channels,
+    SocDescriptor soc_desc) {
+    LocalChip* local_chip = get_local_chip(gateway_id);
+    auto remote_chip = RemoteChip::create(
+        local_chip,
+        EthCoord{0, 0, 0, 0},  // P150 doesn't use eth coords
+        gateway_eth_channels,
+        std::move(soc_desc));
+    add_chip(chip_id, ChipType::SILICON, std::move(remote_chip));
+    log_info(
+        LogUMD,
+        "Dynamically registered remote chip {} via gateway {} (channels: [{}])",
+        chip_id,
+        gateway_id,
+        fmt::join(gateway_eth_channels, ", "));
+}
+
 HarvestingMasks Cluster::get_harvesting_masks(
     ChipId chip_id,
     ClusterDescriptor* cluster_desc,

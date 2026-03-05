@@ -56,6 +56,10 @@ void RemoteCommunicationLiteFabric::wait_for_non_mmio_flush(const std::chrono::m
     host_interface.wait_for_all_writes_consumed(core_coord);
 }
 
+void RemoteCommunicationLiteFabric::set_num_hops(uint32_t num_hops) {
+    host_interface.num_hops = num_hops;
+}
+
 void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     const std::unordered_set<tt_xy_pair>& cores) {
     RemoteCommunication::set_remote_transfer_ethernet_cores(cores);
@@ -72,19 +76,58 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     // retained stale values.  Setting h2d = d2h means "no pending writes",
     // which prevents wait_for_all_writes_consumed from deadlocking on a
     // stale mismatch.
+    //
+    // Double-sync protocol to close the TOCTOU race:
+    //   1. Read d2h from device, write h2d = d2h to device (clears stale h2d).
+    //   2. If the FW was mid-processing a phantom packet using the old stale h2d
+    //      between our read (1) and write (1), d2h will have advanced.
+    //   3. Re-read d2h and write h2d = d2h again to catch any d2h advance.
+    // After two passes the FW sees h2d == d2h and has no phantom to process.
     tt_xy_pair eth_core = *cores.begin();
     CoreCoord cc(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
-    uint32_t dev_iface_word = 0;
-    host_interface.tt_device->read_from_device(
-        &dev_iface_word, cc, host_interface.host_interface_on_device_addr, sizeof(dev_iface_word));
-    uint8_t dev_d2h_sender = dev_iface_word & 0xFF;
-    uint8_t dev_d2h_receiver = (dev_iface_word >> 8) & 0xFF;
+    const uint32_t h2d_device_addr =
+        host_interface.host_interface_on_device_addr + offsetof(decltype(host_interface), h2d);
 
-    host_interface.h2d.sender_host_write_index = dev_d2h_sender;
-    host_interface.h2d.receiver_host_read_index = dev_d2h_receiver;
-    host_interface.d2h.fabric_sender_channel_index = dev_d2h_sender;
-    host_interface.d2h.fabric_receiver_channel_index = dev_d2h_receiver;
+    auto sync_h2d_with_device = [&]() {
+        uint32_t dev_iface_word = 0;
+        host_interface.tt_device->read_from_device(
+            &dev_iface_word, cc, host_interface.host_interface_on_device_addr, sizeof(dev_iface_word));
+        uint8_t dev_d2h_sender = dev_iface_word & 0xFF;
+        uint8_t dev_d2h_receiver = (dev_iface_word >> 8) & 0xFF;
+
+        host_interface.h2d.sender_host_write_index = dev_d2h_sender;
+        host_interface.h2d.receiver_host_read_index = dev_d2h_receiver;
+        host_interface.d2h.fabric_sender_channel_index = dev_d2h_sender;
+        host_interface.d2h.fabric_receiver_channel_index = dev_d2h_receiver;
+
+        tt_driver_atomics::mfence();
+        host_interface.tt_device->write_to_device(
+            &host_interface.h2d, cc, h2d_device_addr, sizeof(host_interface.h2d));
+    };
+
+    // Pass 1: clear stale h2d and close the race window for any in-flight phantom.
+    sync_h2d_with_device();
+    // Pass 2: re-read d2h in case the FW advanced it during pass 1.
+    sync_h2d_with_device();
+
     host_interface.read_event_counter = 0;
+
+    // Clear stale read event values in all receiver buffer slots on the MMIO ETH core.
+    // When a channel is re-bound to a new remote chip (e.g. a 2-hop chip sharing the
+    // same MMIO ETH channel as a 1-hop chip), the receiver buffer headers may contain
+    // read event IDs from prior reads by the previous chip.  The new chip starts with
+    // read_event_counter=0 and would see stale event > 0, triggering
+    // "Read event out of order".  Writing 0xdeadbeef (the "no event" sentinel, same as
+    // firmware init in channel_util.hpp) prevents this.
+    for (size_t slot = 0; slot < lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0]; slot++) {
+        uint32_t slot_addr = host_interface.receiver_channel_base +
+            slot * lite_fabric::CHANNEL_BUFFER_SIZE;
+        uint32_t event_offset = slot_addr +
+            offsetof(lite_fabric::FabricLiteHeader, command_fields) +
+            offsetof(lite_fabric::NocReadCommandHeader, event);
+        uint64_t sentinel = 0xdeadbeef;
+        host_interface.tt_device->write_to_device(&sentinel, cc, event_offset, sizeof(sentinel));
+    }
 }
 
 void RemoteCommunicationLiteFabric::write_remote_reg(uint32_t reg_addr, uint32_t reg_value) {

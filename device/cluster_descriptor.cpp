@@ -1270,6 +1270,31 @@ HarvestingMasks ClusterDescriptor::get_harvesting_masks(ChipId chip_id) const {
     return it->second;
 }
 
+void ClusterDescriptor::register_chip(
+    ChipId chip_id,
+    uint64_t unique_id,
+    tt::ARCH arch,
+    ChipId gateway_mmio_id,
+    BoardType board_type,
+    bool noc_translation,
+    const HarvestingMasks& harvesting) {
+    all_chips.insert(chip_id);
+    chip_unique_ids[chip_id] = unique_id;
+    chip_arch[chip_id] = arch;
+    closest_mmio_chip_cache[chip_id] = gateway_mmio_id;
+    chip_board_type[chip_id] = board_type;
+    noc_translation_enabled[chip_id] = noc_translation;
+    harvesting_masks_map[chip_id] = harvesting;
+    chips_grouped_by_closest_mmio[gateway_mmio_id].insert(chip_id);
+}
+
+void ClusterDescriptor::add_ethernet_connection(
+    ChipId chip_a, uint32_t channel_a,
+    ChipId chip_b, uint32_t channel_b) {
+    ethernet_connections[chip_a][channel_a] = {chip_b, channel_b};
+    ethernet_connections[chip_b][channel_b] = {chip_a, channel_a};
+}
+
 void ClusterDescriptor::add_chip_to_board(ChipId chip_id, uint64_t board_id) {
     if (chip_to_board_id.find(chip_id) != chip_to_board_id.end() && chip_to_board_id[chip_id] != board_id) {
         throw std::runtime_error(

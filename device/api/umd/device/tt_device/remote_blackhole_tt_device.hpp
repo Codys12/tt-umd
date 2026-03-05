@@ -53,6 +53,11 @@ public:
     // accurate chip info (harvesting masks, DRAM training status, etc.) from the remote chip.
     void upgrade_firmware_info_provider();
 
+    // Reset lite_fabric_running_ to false.  Called during teardown so that
+    // subsequent reads/writes are silently dropped until the next
+    // upgrade_firmware_info_provider() call re-enables them.
+    void set_lite_fabric_running(bool running);
+
 protected:
     bool is_arc_available_over_axi() override;
 

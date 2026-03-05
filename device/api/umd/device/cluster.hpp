@@ -682,6 +682,26 @@ public:
      */
     tlb_configuration get_tlb_configuration(const ChipId chip, const CoreCoord core);
 
+    /**
+     * Dynamically register a new remote chip after initial construction.
+     * Used by Metal's N-hop BFS discovery to add chips discovered via
+     * lite fabric that were not visible during UMD's initial topology scan.
+     *
+     * The caller must have already added the chip to the ClusterDescriptor
+     * (all_chips, chip_unique_ids, closest_mmio_chip_cache, ethernet_connections, etc.)
+     * before calling this method.
+     *
+     * @param chip_id The logical chip ID for the new remote chip.
+     * @param gateway_id The MMIO chip used as gateway for communication.
+     * @param gateway_eth_channels ETH channels on the gateway used for tunneling.
+     * @param soc_desc SOC descriptor for the new chip (may be a proxy from the gateway).
+     */
+    void register_remote_chip(
+        ChipId chip_id,
+        ChipId gateway_id,
+        const std::set<uint32_t>& gateway_eth_channels,
+        SocDescriptor soc_desc);
+
 private:
     // Helper functions
     // Broadcast.

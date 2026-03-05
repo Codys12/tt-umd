@@ -126,6 +126,8 @@ std::chrono::milliseconds RemoteBlackholeTTDevice::wait_eth_core_training(
     return std::chrono::milliseconds(0);
 }
 
+void RemoteBlackholeTTDevice::set_lite_fabric_running(bool running) { lite_fabric_running_ = running; }
+
 void RemoteBlackholeTTDevice::noc_multicast_write(
     void* dst, size_t size, tt_xy_pair core_start, tt_xy_pair core_end, uint64_t addr) {
     // TODO: implement multicast over remote communication.

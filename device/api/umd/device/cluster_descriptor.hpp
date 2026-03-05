@@ -242,6 +242,22 @@ public:
 
     const std::unordered_map<ChipId, uint16_t> &get_chip_to_bus_id() const;
 
+    // Register a new chip discovered after initial topology scan (e.g., via BFS through lite fabric).
+    // Populates all required descriptor fields using proxy data from the gateway chip.
+    void register_chip(
+        ChipId chip_id,
+        uint64_t unique_id,
+        tt::ARCH arch,
+        ChipId gateway_mmio_id,
+        BoardType board_type,
+        bool noc_translation,
+        const HarvestingMasks& harvesting);
+
+    // Add an ethernet connection between two chips (bidirectional).
+    void add_ethernet_connection(
+        ChipId chip_a, uint32_t channel_a,
+        ChipId chip_b, uint32_t channel_b);
+
 private:
     int get_ethernet_link_coord_distance(const EthCoord &location_a, const EthCoord &location_b) const;
 

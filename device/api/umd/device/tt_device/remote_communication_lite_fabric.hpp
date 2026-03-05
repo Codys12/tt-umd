@@ -40,6 +40,8 @@ public:
     void write_remote_reg(uint32_t reg_addr, uint32_t reg_value) override;
     void write_remote_reg(uint32_t reg_addr, uint32_t reg_value, tt_xy_pair sender_core) override;
 
+    void set_num_hops(uint32_t num_hops) override;
+
     // Override to reset host_interface counters when bindings change.
     // After a binding change, the new core's d2h may differ from the host's
     // accumulated h2d, causing wait_for_all_writes_consumed to deadlock.

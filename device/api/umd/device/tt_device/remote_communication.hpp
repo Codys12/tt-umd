@@ -59,6 +59,10 @@ public:
         write_remote_reg(reg_addr, reg_value);
     }
 
+    // Set the number of lite fabric hops to reach the target chip.
+    // 1 = direct ETH link (default), 2+ = multi-hop forwarding.
+    virtual void set_num_hops(uint32_t /*num_hops*/) {}
+
     // Set the ethernet cores which can be used for remote communication on the assigned local chip.
     // The cores should be in translated coordinates.
     virtual void set_remote_transfer_ethernet_cores(const std::unordered_set<tt_xy_pair>& cores);

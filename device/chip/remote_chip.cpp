@@ -173,6 +173,15 @@ void RemoteChip::upgrade_remote_chip_info_after_lite_fabric() {
     wait_chip_to_be_ready();
 }
 
+void RemoteChip::downgrade_after_lite_fabric_teardown() {
+    if (tt_device_->get_arch() != tt::ARCH::BLACKHOLE) {
+        return;
+    }
+    auto* bh_device = dynamic_cast<RemoteBlackholeTTDevice*>(tt_device_.get());
+    TT_ASSERT(bh_device != nullptr, "Expected RemoteBlackholeTTDevice for Blackhole remote chip");
+    bh_device->set_lite_fabric_running(false);
+}
+
 void RemoteChip::set_remote_transfer_ethernet_cores(const std::unordered_set<CoreCoord>& cores) {
     remote_communication_->set_remote_transfer_ethernet_cores(
         local_chip_->get_soc_descriptor().translate_coords_to_xy_pair(cores, CoordSystem::TRANSLATED));

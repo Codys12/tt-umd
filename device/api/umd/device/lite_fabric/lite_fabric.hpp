@@ -131,6 +131,24 @@ struct LiteFabricConfig {
     volatile RoutingEnabledState routing_enabled = RoutingEnabledState::STOPPED;
 
     unsigned char padding4[14]{};
+
+    // Multi-hop forwarding configuration.  Must match the FW-side
+    // FabricLiteConfig::ForwardingConfig in host_interface.hpp so that
+    // sizeof(LiteFabricConfig) is identical and the LiteFabricMemoryMap
+    // host_interface offset stays in sync between host and device.
+    struct ForwardingConfig {
+        volatile uint8_t enabled = 0;
+        uint8_t downstream_noc_x = 0;
+        uint8_t downstream_noc_y = 0;
+        uint8_t downstream_num_buffers = 0;
+        volatile uint32_t downstream_sender_buf_addr = 0;
+        volatile uint32_t downstream_h2d_addr = 0;
+        uint32_t downstream_buffer_size = 0;
+        // Must match FW-side ForwardingConfig in host_interface.hpp:
+        // initial_wr_idx + padding to keep struct sizes identical.
+        uint8_t initial_wr_idx = 0;
+        uint8_t _forwarding_pad[15]{};
+    } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 
 static_assert(sizeof(LiteFabricConfig) % 16 == 0);
@@ -184,6 +202,11 @@ struct HostToLiteFabricInterface {
     uint32_t mmio_eth_core_y = 0;
     TTDevice* tt_device = nullptr;
 
+    // Number of lite fabric hops to reach the target chip.  1 = direct ETH link,
+    // 2+ = multi-hop forwarding through intermediate chips.  Used by write_reg,
+    // write_one_page, and read_one_page to set routing_fields in the header.
+    uint32_t num_hops = 1;
+
     // Per-instance read event counter.  Each HostToLiteFabricInterface (one per
     // lite-fabric tunnel / remote device) tracks its own monotonic event ID so
     // concurrent reads on different tunnels cannot interfere with each other.
@@ -215,7 +238,7 @@ struct HostToLiteFabricInterface {
     // unicast writes.
     void write_reg(uint32_t reg_addr, uint32_t reg_value, CoreCoord sender_core) {
         FabricLiteHeader header;
-        header.to_chip_unicast(1);
+        header.to_chip_unicast(num_hops);
         header.to_write_reg(lite_fabric::WriteRegCommandHeader{reg_addr, reg_value});
         header.payload_size_bytes = sizeof(FabricLiteHeader);
         header.unaligned_offset = 0;
@@ -271,12 +294,46 @@ struct HostToLiteFabricInterface {
         uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
         auto start = std::chrono::steady_clock::now();
         auto last_warn = start;
+        bool self_heal_attempted = false;
         do {
             tt_device->read_from_device(
                 (void*)(reinterpret_cast<uintptr_t>(this) + offset),
                 translated_core_sender,
                 host_interface_on_device_addr + offset,
                 sizeof(DeviceToHost));
+
+            // Immediate self-healing: if host thinks there are outstanding
+            // writes but the device sender is idle (device h2d == device d2h),
+            // the host cached h2d is stale.  Re-sync without waiting 2s.
+            if (!self_heal_attempted &&
+                d2h.fabric_sender_channel_index != h2d.sender_host_write_index) {
+                self_heal_attempted = true;
+                uint32_t dev_h2d_word = 0;
+                tt_device->read_from_device(
+                    &dev_h2d_word,
+                    translated_core_sender,
+                    host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, h2d),
+                    sizeof(uint32_t));
+                uint8_t dev_h2d_sender = dev_h2d_word & 0xFF;
+                if (dev_h2d_sender == d2h.fabric_sender_channel_index) {
+                    log_warning(
+                        LogUMD,
+                        "wait_for_all_writes_consumed: immediate self-healing on core ({},{}) — "
+                        "device h2d==d2h=={}, resyncing host h2d {} -> {}",
+                        translated_core_sender.x,
+                        translated_core_sender.y,
+                        dev_h2d_sender,
+                        h2d.sender_host_write_index,
+                        dev_h2d_sender);
+                    h2d.sender_host_write_index = dev_h2d_sender;
+                    d2h.fabric_sender_channel_index = dev_h2d_sender;
+                    // Also sync receiver index — d2h was already read above.
+                    h2d.receiver_host_read_index = d2h.fabric_receiver_channel_index;
+                    flush_h2d(translated_core_sender);
+                    break;
+                }
+            }
+
             auto now = std::chrono::steady_clock::now();
             if (now - last_warn > k_WarnInterval) {
                 last_warn = now;
@@ -346,6 +403,31 @@ struct HostToLiteFabricInterface {
                     fw_has_unsent,
                     fw_can_send,
                     fw_loop_counter);
+
+                // Self-healing: if device h2d == device d2h, FW considers all
+                // packets processed.  The mismatch is a host-side counter desync
+                // (e.g. from multiple remote chips sharing the same MMIO ETH
+                // core channel across teardown/re-init cycles).  Resync host
+                // counters to match device state and break out.
+                if (dev_h2d_sender == dev_d2h_sender) {
+                    log_warning(
+                        LogUMD,
+                        "wait_for_all_writes_consumed: self-healing on core ({},{}) — "
+                        "device h2d==d2h=={}, resyncing host h2d {} -> {} and d2h {} -> {}",
+                        translated_core_sender.x,
+                        translated_core_sender.y,
+                        dev_d2h_sender,
+                        h2d.sender_host_write_index,
+                        dev_d2h_sender,
+                        d2h.fabric_sender_channel_index,
+                        dev_d2h_sender);
+                    h2d.sender_host_write_index = dev_d2h_sender;
+                    d2h.fabric_sender_channel_index = dev_d2h_sender;
+                    // Flush resynced h2d to device so FW and host stay in agreement.
+                    flush_h2d(translated_core_sender);
+                    break;
+                }
+
                 if (now - start > k_Timeout) {
                     throw std::runtime_error(fmt::format(
                         "Lite fabric wait_for_all_writes_consumed timed out after {}s on core ({},{}): "
@@ -400,12 +482,50 @@ private:
         uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
         auto start = std::chrono::steady_clock::now();
         auto last_warn = start;
+        bool self_heal_attempted = false;
         do {
             tt_device->read_from_device(
                 (void*)(reinterpret_cast<uintptr_t>(this) + offset),
                 translated_core_sender,
                 host_interface_on_device_addr + offset,
                 sizeof(DeviceToHost));
+
+            // Self-healing: if the slot appears full but the device sender is
+            // actually idle (device h2d == device d2h), the host's cached h2d
+            // is stale from another HostToLiteFabricInterface that shared the
+            // same MMIO ETH sender during multi-hop discovery.  Re-sync host
+            // h2d to match device state so the write can proceed.
+            if (!self_heal_attempted &&
+                (h2d.sender_host_write_index + 1) % NUM_BUFFERS == d2h.fabric_sender_channel_index) {
+                self_heal_attempted = true;
+                uint32_t dev_h2d_word = 0;
+                tt_device->read_from_device(
+                    &dev_h2d_word,
+                    translated_core_sender,
+                    host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, h2d),
+                    sizeof(uint32_t));
+                uint8_t dev_h2d_sender = dev_h2d_word & 0xFF;
+                if (dev_h2d_sender == d2h.fabric_sender_channel_index) {
+                    log_warning(
+                        LogUMD,
+                        "wait_for_empty_write_slot: self-healing on core ({},{}) — "
+                        "device h2d==d2h=={}, resyncing host h2d {} -> {}",
+                        translated_core_sender.x,
+                        translated_core_sender.y,
+                        dev_h2d_sender,
+                        h2d.sender_host_write_index,
+                        dev_h2d_sender);
+                    h2d.sender_host_write_index = dev_h2d_sender;
+                    d2h.fabric_sender_channel_index = dev_h2d_sender;
+                    // Also sync receiver index — d2h was already read above.
+                    // Without this, flush_h2d writes a stale h2d.receiver to the
+                    // device, blocking the MMIO receiver completion gate.
+                    h2d.receiver_host_read_index = d2h.fabric_receiver_channel_index;
+                    flush_h2d(translated_core_sender);
+                    break;
+                }
+            }
+
             auto now = std::chrono::steady_clock::now();
             if (now - last_warn > k_WarnInterval) {
                 last_warn = now;
@@ -477,11 +597,29 @@ private:
                     uint32_t recv_d2h_idx = (rdiag >> 8) & 0xFF;
                     uint32_t recv_h2d_idx = rdiag & 0xFF;
                     uint32_t loop_cnt = dev_config.neighbour_handshake;
+                    // Fresh read of d2h and h2d from device L1 to distinguish
+                    // "FW didn't see h2d" from "FW processed but response lost".
+                    // The host-side d2h is stale (last read during wait_for_empty_write_slot).
+                    uint32_t dev_d2h_word = 0;
+                    tt_device->read_from_device(
+                        &dev_d2h_word, translated_core_sender,
+                        host_interface_on_device_addr, sizeof(dev_d2h_word));
+                    uint8_t dev_d2h_sender = dev_d2h_word & 0xFF;
+                    uint8_t dev_d2h_receiver = (dev_d2h_word >> 8) & 0xFF;
+                    uint32_t dev_h2d_word = 0;
+                    tt_device->read_from_device(
+                        &dev_h2d_word, translated_core_sender,
+                        host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, h2d),
+                        sizeof(dev_h2d_word));
+                    uint8_t dev_h2d_sender = dev_h2d_word & 0xFF;
+                    uint8_t dev_h2d_receiver = (dev_h2d_word >> 8) & 0xFF;
+
                     diag_str = fmt::format(
                         " FW: loop_cnt={} routing={} state={} | "
                         "sender: nfs={} comp_reg={} unsent={} can={} | "
                         "receiver: wr_sent={} comp={} d2h_idx={} h2d_idx={} | "
-                        "host: d2h.sender={} h2d.sender={} h2d.recv={}",
+                        "host: d2h.sender={} h2d.sender={} h2d.recv={} | "
+                        "dev: d2h.sender={} d2h.recv={} h2d.sender={} h2d.recv={}",
                         loop_cnt,
                         static_cast<uint32_t>(dev_config.routing_enabled),
                         static_cast<uint32_t>(dev_config.current_state),
@@ -489,7 +627,9 @@ private:
                         recv_wr_sent, recv_comp, recv_d2h_idx, recv_h2d_idx,
                         d2h.fabric_sender_channel_index,
                         h2d.sender_host_write_index,
-                        h2d.receiver_host_read_index);
+                        h2d.receiver_host_read_index,
+                        dev_d2h_sender, dev_d2h_receiver,
+                        dev_h2d_sender, dev_h2d_receiver);
                 }
                 throw std::runtime_error(fmt::format(
                     "Lite fabric wait_for_read_event timed out after {}s on core ({},{}): "
@@ -563,7 +703,7 @@ private:
 
     void write_one_page(void* mem_ptr, size_t size, CoreCoord sender_core, uint64_t dst_noc_addr) {
         FabricLiteHeader header;
-        header.to_chip_unicast(1);
+        header.to_chip_unicast(num_hops);
         header.to_noc_unicast_write(lite_fabric::NocUnicastCommandHeader{dst_noc_addr}, size);
 
         header.unaligned_offset = dst_noc_addr & (l1_alignment_bytes - 1);
@@ -608,9 +748,33 @@ private:
 
     void read_one_page(void* mem_ptr, size_t size, CoreCoord receiver_core, uint64_t src_noc_addr) {
         FabricLiteHeader header;
-        header.to_chip_unicast(1);
+        header.to_chip_unicast(num_hops);
         header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event_counter}, size);
         header.unaligned_offset = 0;
+
+        // Receiver self-healing: sync h2d.receiver_host_read_index from device d2h
+        // to ensure we poll the correct receiver buffer slot. Multiple
+        // HostToLiteFabricInterfaces sharing the same MMIO ETH core can desync
+        // the receiver index during Phase 2b multi-hop discovery.
+        {
+            uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
+            tt_device->read_from_device(
+                (void*)(reinterpret_cast<uintptr_t>(this) + offset),
+                receiver_core,
+                host_interface_on_device_addr + offset,
+                sizeof(DeviceToHost));
+            if (h2d.receiver_host_read_index != d2h.fabric_receiver_channel_index) {
+                log_warning(
+                    LogUMD,
+                    "read_one_page: receiver self-healing on core ({},{}) — "
+                    "syncing h2d.receiver {} -> d2h.receiver {}",
+                    receiver_core.x,
+                    receiver_core.y,
+                    h2d.receiver_host_read_index,
+                    d2h.fabric_receiver_channel_index);
+                h2d.receiver_host_read_index = d2h.fabric_receiver_channel_index;
+            }
+        }
 
         uint32_t receiver_header_address = get_next_receiver_buffer_slot_address(receiver_channel_base);
         log_debug(
@@ -638,6 +802,16 @@ private:
             sizeof(uint8_t));
 
         tt_device->read_from_device(mem_ptr, receiver_core, receiver_data_address + read_back_unaligned_offset, size);
+
+        // Clear the event field in the receiver buffer to prevent stale events
+        // from confusing future reads by different HostToLiteFabricInterfaces
+        // that share the same MMIO ETH core.
+        uint32_t dead = 0xdeadbeef;
+        tt_device->write_to_device(
+            &dead, receiver_core,
+            receiver_header_address + offsetof(FabricLiteHeader, command_fields) +
+                offsetof(lite_fabric::NocReadCommandHeader, event),
+            sizeof(dead));
 
         h2d.receiver_host_read_index =
             lite_fabric::wrap_increment<RECEIVER_NUM_BUFFERS_ARRAY[0]>(h2d.receiver_host_read_index);

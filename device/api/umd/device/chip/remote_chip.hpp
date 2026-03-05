@@ -44,6 +44,11 @@ public:
     // Must be called after lite fabric is running.  No-op for non-Blackhole chips.
     void upgrade_remote_chip_info_after_lite_fabric();
 
+    // For Blackhole remote chips: reset lite_fabric_running_ to false during teardown.
+    // Subsequent reads/writes will be silently dropped until the next
+    // upgrade_remote_chip_info_after_lite_fabric() call.  No-op for non-Blackhole chips.
+    void downgrade_after_lite_fabric_teardown();
+
     TTDevice* get_tt_device() override;
     SysmemManager* get_sysmem_manager() override;
     TLBManager* get_tlb_manager() override;
