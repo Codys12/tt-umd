@@ -258,6 +258,10 @@ public:
         ChipId chip_a, uint32_t channel_a,
         ChipId chip_b, uint32_t channel_b);
 
+    // Remove a chip and all its ethernet connections from the descriptor.
+    // Used to exclude unreachable chips before control plane initialization.
+    void remove_chip(ChipId chip_id);
+
 private:
     int get_ethernet_link_coord_distance(const EthCoord &location_a, const EthCoord &location_b) const;
 

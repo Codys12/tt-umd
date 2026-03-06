@@ -20,6 +20,11 @@ void RemoteCommunicationLiteFabric::read_non_mmio(
     const std::chrono::milliseconds timeout_ms) {
     tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
     CoreCoord core_coord = CoreCoord(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
+    log_info(
+        LogUMD,
+        "read_non_mmio: target=({},{}) src={:#x} size={} via eth=({},{}) event={}",
+        target_core.x, target_core.y, core_src, size_in_bytes,
+        eth_core.x, eth_core.y, host_interface.read_event_counter);
     host_interface.read(dest, size_in_bytes, core_coord, target_core, core_src);
 }
 
@@ -112,14 +117,26 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
 
     host_interface.read_event_counter = 0;
 
-    // Clear stale read event values in all receiver buffer slots on the MMIO ETH core.
+    // Also sync ch1 h2d with device d2h (read response channel).
+    {
+        uint32_t ch1_dev_iface_word = 0;
+        host_interface.tt_device->read_from_device(
+            &ch1_dev_iface_word, cc, host_interface.receiver_host_interface_on_device_addr, sizeof(ch1_dev_iface_word));
+        uint8_t ch1_d2h_receiver = (ch1_dev_iface_word >> 8) & 0xFF;
+        host_interface.recv_ch1.receiver_host_read_index = ch1_d2h_receiver;
+        host_interface.recv_ch1.d2h_receiver_index = ch1_d2h_receiver;
+        // Flush ch1 h2d to device (sender=0, receiver=synced).
+        host_interface.flush_recv_ch1_h2d(cc);
+    }
+
+    // Clear stale read event values in all ch1 receiver buffer slots on the MMIO ETH core.
     // When a channel is re-bound to a new remote chip (e.g. a 2-hop chip sharing the
     // same MMIO ETH channel as a 1-hop chip), the receiver buffer headers may contain
     // read event IDs from prior reads by the previous chip.  The new chip starts with
     // read_event_counter=0 and would see stale event > 0, triggering
     // "Read event out of order".  Writing 0xdeadbeef (the "no event" sentinel, same as
     // firmware init in channel_util.hpp) prevents this.
-    for (size_t slot = 0; slot < lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0]; slot++) {
+    for (size_t slot = 0; slot < lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[1]; slot++) {
         uint32_t slot_addr = host_interface.receiver_channel_base +
             slot * lite_fabric::CHANNEL_BUFFER_SIZE;
         uint32_t event_offset = slot_addr +

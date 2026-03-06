@@ -147,7 +147,8 @@ struct LiteFabricConfig {
         // Must match FW-side ForwardingConfig in host_interface.hpp:
         // initial_wr_idx + padding to keep struct sizes identical.
         uint8_t initial_wr_idx = 0;
-        uint8_t _forwarding_pad[15]{};
+        uint8_t is_reverse_relay = 0;
+        uint8_t _forwarding_pad[14]{};
     } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 
@@ -188,8 +189,10 @@ struct HostToLiteFabricInterface {
         volatile uint8_t receiver_host_read_index = 0;
     } __attribute((packed)) h2d;
 
+    // Ch0 host interface device address (for sender h2d flushing).
     uint32_t host_interface_on_device_addr = 0;
     uint32_t sender_channel_base = 0;
+    // Ch1 receiver channel base (where read responses arrive).
     uint32_t receiver_channel_base = 0;
     uint32_t eth_barrier_addr = 0;
     uint32_t tensix_barrier_addr = 0;
@@ -212,12 +215,40 @@ struct HostToLiteFabricInterface {
     // concurrent reads on different tunnels cannot interfere with each other.
     uint64_t read_event_counter = 0;
 
+    // Ch1 host interface device address (for receiver h2d flushing).
+    // Read responses are delivered to ch1 receiver buffers; the host must
+    // flush the receiver_host_read_index to ch1's h2d on device.
+    uint32_t receiver_host_interface_on_device_addr = 0;
+
+    // Ch1 receiver tracking: mirrors ch1's h2d/d2h on device.
+    // h2d.sender_host_write_index is always 0 (the NOC_READ handler manages
+    // ch1 sender internally); only receiver_host_read_index is used.
+    struct ReceiverCh1State {
+        uint8_t receiver_host_read_index = 0;
+        uint8_t d2h_receiver_index = 0;
+    } recv_ch1;
+
     inline void init() volatile {
         h2d.sender_host_write_index = 0;
         h2d.receiver_host_read_index = 0;
         d2h.fabric_sender_channel_index = 0;
         d2h.fabric_receiver_channel_index = 0;
         read_event_counter = 0;
+        recv_ch1.receiver_host_read_index = 0;
+        recv_ch1.d2h_receiver_index = 0;
+    }
+
+    // Flush ch1 receiver h2d to device.  Ch1 sender on the MMIO side is
+    // unused (read responses flow remote→MMIO only), so sender=0 is safe.
+    void flush_recv_ch1_h2d(CoreCoord translated_core) {
+        tt_driver_atomics::mfence();
+        // Pack h2d word: byte 0 = sender (0), byte 1 = receiver
+        uint8_t h2d_bytes[4] = {0, recv_ch1.receiver_host_read_index, 0, 0};
+        tt_device->write_to_device(
+            h2d_bytes,
+            translated_core,
+            receiver_host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, h2d),
+            sizeof(h2d_bytes));
     }
 
     void read(void* mem_ptr, size_t size, CoreCoord receiver_core, tt_xy_pair src_core, uint64_t src_addr) {
@@ -474,6 +505,11 @@ private:
     uint32_t get_next_receiver_buffer_slot_address(uint32_t channel_address) const {
         auto buffer_index = h2d.receiver_host_read_index;
         return channel_address + buffer_index * CHANNEL_BUFFER_SIZE;
+    }
+
+    // Ch1 receiver buffer slot address (for read responses).
+    uint32_t get_next_ch1_receiver_buffer_slot_address() const {
+        return receiver_channel_base + recv_ch1.receiver_host_read_index * CHANNEL_BUFFER_SIZE;
     }
 
     void wait_for_empty_write_slot(CoreCoord translated_core_sender) {
@@ -752,31 +788,33 @@ private:
         header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event_counter}, size);
         header.unaligned_offset = 0;
 
-        // Receiver self-healing: sync h2d.receiver_host_read_index from device d2h
-        // to ensure we poll the correct receiver buffer slot. Multiple
-        // HostToLiteFabricInterfaces sharing the same MMIO ETH core can desync
-        // the receiver index during Phase 2b multi-hop discovery.
+        // Ch1 receiver self-healing: sync recv_ch1.receiver_host_read_index
+        // from ch1 device d2h to ensure we poll the correct receiver buffer
+        // slot.  Multiple HostToLiteFabricInterfaces sharing the same MMIO ETH
+        // core can desync the receiver index during Phase 2b multi-hop discovery.
         {
-            uint32_t offset = offsetof(HostToLiteFabricInterface, d2h);
+            DeviceToHost ch1_d2h{};
             tt_device->read_from_device(
-                (void*)(reinterpret_cast<uintptr_t>(this) + offset),
+                &ch1_d2h,
                 receiver_core,
-                host_interface_on_device_addr + offset,
-                sizeof(DeviceToHost));
-            if (h2d.receiver_host_read_index != d2h.fabric_receiver_channel_index) {
+                receiver_host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, d2h),
+                sizeof(ch1_d2h));
+            recv_ch1.d2h_receiver_index = ch1_d2h.fabric_receiver_channel_index;
+            if (recv_ch1.receiver_host_read_index != recv_ch1.d2h_receiver_index) {
                 log_warning(
                     LogUMD,
-                    "read_one_page: receiver self-healing on core ({},{}) — "
-                    "syncing h2d.receiver {} -> d2h.receiver {}",
+                    "read_one_page: ch1 receiver self-healing on core ({},{}) — "
+                    "syncing recv_ch1 {} -> d2h.receiver {}",
                     receiver_core.x,
                     receiver_core.y,
-                    h2d.receiver_host_read_index,
-                    d2h.fabric_receiver_channel_index);
-                h2d.receiver_host_read_index = d2h.fabric_receiver_channel_index;
+                    recv_ch1.receiver_host_read_index,
+                    recv_ch1.d2h_receiver_index);
+                recv_ch1.receiver_host_read_index = recv_ch1.d2h_receiver_index;
             }
         }
 
-        uint32_t receiver_header_address = get_next_receiver_buffer_slot_address(receiver_channel_base);
+        // Read responses arrive on ch1 receiver buffers.
+        uint32_t receiver_header_address = get_next_ch1_receiver_buffer_slot_address();
         log_debug(
             LogUMD,
             "Board {:#x} {} Reading data from {} {:#x} unaligned {} src node {:#x}",
@@ -788,24 +826,25 @@ private:
             src_noc_addr);
         uint32_t receiver_data_address = receiver_header_address + sizeof(FabricLiteHeader);
 
+        // Send read command through ch0 sender.
         wait_for_empty_write_slot(receiver_core);
         send_payload_flush_non_blocking_from_address(header, receiver_core, sender_channel_base);
 
+        // Wait for response on ch1 receiver.
         wait_for_read_event(receiver_core, receiver_header_address);
 
         uint8_t read_back_unaligned_offset = 0;
         tt_device->read_from_device(
             &read_back_unaligned_offset,
             receiver_core,
-
             receiver_header_address + offsetof(FabricLiteHeader, unaligned_offset),
             sizeof(uint8_t));
 
         tt_device->read_from_device(mem_ptr, receiver_core, receiver_data_address + read_back_unaligned_offset, size);
 
-        // Clear the event field in the receiver buffer to prevent stale events
-        // from confusing future reads by different HostToLiteFabricInterfaces
-        // that share the same MMIO ETH core.
+        // Clear the event field in the ch1 receiver buffer to prevent stale
+        // events from confusing future reads by different
+        // HostToLiteFabricInterfaces that share the same MMIO ETH core.
         uint32_t dead = 0xdeadbeef;
         tt_device->write_to_device(
             &dead, receiver_core,
@@ -813,9 +852,10 @@ private:
                 offsetof(lite_fabric::NocReadCommandHeader, event),
             sizeof(dead));
 
-        h2d.receiver_host_read_index =
-            lite_fabric::wrap_increment<RECEIVER_NUM_BUFFERS_ARRAY[0]>(h2d.receiver_host_read_index);
-        flush_h2d(receiver_core);
+        // Advance ch1 receiver index and flush to ch1 host interface on device.
+        recv_ch1.receiver_host_read_index =
+            lite_fabric::wrap_increment<RECEIVER_NUM_BUFFERS_ARRAY[1]>(recv_ch1.receiver_host_read_index);
+        flush_recv_ch1_h2d(receiver_core);
     }
 
     void read_noc_addr(void* mem_ptr, size_t size, CoreCoord receiver_core, uint64_t src_noc_addr) {
@@ -849,26 +889,43 @@ struct LiteFabricMemoryMap {
     uint32_t padding1[3]{};
     uint32_t worker_semaphore{};
     uint32_t padding2[7]{};
-    unsigned char sender_channel_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
-    unsigned char padding3[192]{};
-    unsigned char
-        receiver_channel_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
+    // Channel 0 sender buffers (outbound commands: writes + read commands)
+    unsigned char sender_ch0_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+    // Channel 1 sender buffers (read responses going back to host)
+    unsigned char sender_ch1_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[1] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
+    unsigned char padding3[64]{};
+
+    // Channel 0 receiver buffers (incoming commands on remote side)
+    unsigned char receiver_ch0_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+    // Channel 1 receiver buffers (incoming read responses on MMIO side)
+    unsigned char receiver_ch1_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[1] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
     // L1 address of the service_lite_fabric function.
     uint32_t service_lite_fabric_addr{};
     unsigned char padding4[12]{};
 
     lite_fabric::LiteFabricConfig config;
-    lite_fabric::EDMChannelWorkerLocationInfo sender_location_info;
+    lite_fabric::EDMChannelWorkerLocationInfo sender_ch0_location_info;
+    lite_fabric::EDMChannelWorkerLocationInfo sender_ch1_location_info;
 
-    // Must be last because it has members that are only stored on the host.
+    // Channel 0 host interface (outbound commands)
     HostToLiteFabricInterface<lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0], lite_fabric::CHANNEL_BUFFER_SIZE>
         host_interface;
+    // Channel 1 host interface (read responses)
+    HostToLiteFabricInterface<lite_fabric::SENDER_NUM_BUFFERS_ARRAY[1], lite_fabric::CHANNEL_BUFFER_SIZE>
+        host_interface_ch1;
 
     static auto make_host_interface(TTDevice* tt_device) {
         lite_fabric::HostToLiteFabricInterface<SENDER_NUM_BUFFERS_ARRAY[0], CHANNEL_BUFFER_SIZE> host_interface;
-        host_interface.host_interface_on_device_addr = lite_fabric::LiteFabricMemoryMap::get_host_interface_addr();
-        host_interface.sender_channel_base = lite_fabric::LiteFabricMemoryMap::get_send_channel_addr();
-        host_interface.receiver_channel_base = lite_fabric::LiteFabricMemoryMap::get_receiver_channel_addr();
+        host_interface.host_interface_on_device_addr = lite_fabric::LiteFabricMemoryMap::get_host_interface_ch0_addr();
+        host_interface.sender_channel_base = lite_fabric::LiteFabricMemoryMap::get_send_channel_ch0_addr();
+        // Ch0 receiver is used on the remote side; MMIO host reads responses from ch1.
+        host_interface.receiver_channel_base = lite_fabric::LiteFabricMemoryMap::get_receiver_channel_ch1_addr();
+        // Track the ch1 host interface device address for receiver h2d flushing.
+        host_interface.receiver_host_interface_on_device_addr =
+            lite_fabric::LiteFabricMemoryMap::get_host_interface_ch1_addr();
 
         // TODO: these constants need to be moved to HAL once we have it.
         constexpr uint32_t eth_barrier_addr = 12;
@@ -890,16 +947,43 @@ struct LiteFabricMemoryMap {
         return addr;
     }
 
-    static uint32_t get_host_interface_addr() {
+    static uint32_t get_host_interface_ch0_addr() {
         return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, host_interface);
     }
 
-    static uint32_t get_send_channel_addr() {
-        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, sender_channel_buffer);
+    static uint32_t get_host_interface_ch1_addr() {
+        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, host_interface_ch1);
     }
 
+    // Legacy alias
+    static uint32_t get_host_interface_addr() {
+        return get_host_interface_ch0_addr();
+    }
+
+    static uint32_t get_send_channel_ch0_addr() {
+        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, sender_ch0_buffer);
+    }
+
+    static uint32_t get_send_channel_ch1_addr() {
+        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, sender_ch1_buffer);
+    }
+
+    // Legacy alias
+    static uint32_t get_send_channel_addr() {
+        return get_send_channel_ch0_addr();
+    }
+
+    static uint32_t get_receiver_channel_ch0_addr() {
+        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, receiver_ch0_buffer);
+    }
+
+    static uint32_t get_receiver_channel_ch1_addr() {
+        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, receiver_ch1_buffer);
+    }
+
+    // Legacy alias
     static uint32_t get_receiver_channel_addr() {
-        return get_address() + offsetof(lite_fabric::LiteFabricMemoryMap, receiver_channel_buffer);
+        return get_receiver_channel_ch0_addr();
     }
 
     static uint32_t get_service_channel_func_addr() {
@@ -910,8 +994,8 @@ struct LiteFabricMemoryMap {
 static_assert(offsetof(LiteFabricMemoryMap, sender_flow_control_semaphore) % 16 == 0);
 static_assert(offsetof(LiteFabricMemoryMap, sender_connection_live_semaphore) % 16 == 0);
 static_assert(offsetof(LiteFabricMemoryMap, worker_semaphore) % 16 == 0);
-static_assert(offsetof(LiteFabricMemoryMap, sender_channel_buffer) % GLOBAL_ALIGNMENT == 0);
-static_assert(offsetof(LiteFabricMemoryMap, receiver_channel_buffer) % GLOBAL_ALIGNMENT == 0);
+static_assert(offsetof(LiteFabricMemoryMap, sender_ch0_buffer) % GLOBAL_ALIGNMENT == 0);
+static_assert(offsetof(LiteFabricMemoryMap, receiver_ch0_buffer) % GLOBAL_ALIGNMENT == 0);
 static_assert(offsetof(LiteFabricMemoryMap, config) % 16 == 0);
 static_assert(offsetof(LiteFabricMemoryMap, host_interface) % 16 == 0);
 

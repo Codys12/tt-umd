@@ -1295,6 +1295,58 @@ void ClusterDescriptor::add_ethernet_connection(
     ethernet_connections[chip_b][channel_b] = {chip_a, channel_a};
 }
 
+void ClusterDescriptor::remove_chip(ChipId chip_id) {
+    // Remove from all_chips
+    all_chips.erase(chip_id);
+
+    // Remove ethernet connections TO this chip from other chips
+    for (auto& [other_chip, conns] : ethernet_connections) {
+        std::vector<EthernetChannel> to_remove;
+        for (auto& [chan, dst] : conns) {
+            if (std::get<0>(dst) == chip_id) {
+                to_remove.push_back(chan);
+            }
+        }
+        for (auto chan : to_remove) {
+            conns.erase(chan);
+        }
+    }
+    // Remove this chip's own ethernet connections
+    ethernet_connections.erase(chip_id);
+
+    // Remove from other maps
+    chip_unique_ids.erase(chip_id);
+    chip_arch.erase(chip_id);
+    closest_mmio_chip_cache.erase(chip_id);
+    chip_board_type.erase(chip_id);
+    noc_translation_enabled.erase(chip_id);
+    harvesting_masks_map.erase(chip_id);
+    chip_locations.erase(chip_id);
+    active_eth_channels.erase(chip_id);
+    idle_eth_channels.erase(chip_id);
+    asic_locations.erase(chip_id);
+
+    // Remove from chips_grouped_by_closest_mmio
+    for (auto& [mmio_id, group] : chips_grouped_by_closest_mmio) {
+        group.erase(chip_id);
+    }
+
+    // Remove from board_to_chips
+    if (chip_to_board_id.count(chip_id)) {
+        auto board_id = chip_to_board_id[chip_id];
+        if (board_to_chips.count(board_id)) {
+            board_to_chips[board_id].erase(chip_id);
+        }
+        chip_to_board_id.erase(chip_id);
+    }
+
+    // Remove from chips_with_mmio if present
+    chips_with_mmio.erase(chip_id);
+
+    // Remove from bus ID cache
+    chip_to_bus_id.erase(chip_id);
+}
+
 void ClusterDescriptor::add_chip_to_board(ChipId chip_id, uint64_t board_id) {
     if (chip_to_board_id.find(chip_id) != chip_to_board_id.end() && chip_to_board_id[chip_id] != board_id) {
         throw std::runtime_error(

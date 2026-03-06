@@ -16,17 +16,15 @@ namespace tt::umd {
 
 namespace lite_fabric {
 
-// Only 1 receiver because 1 erisc.
-constexpr uint32_t NUM_RECEIVER_CHANNELS = 1;
+// Dual channels: ch0 for outbound commands, ch1 for read responses.
+constexpr uint32_t NUM_RECEIVER_CHANNELS = 2;
+constexpr uint32_t NUM_SENDER_CHANNELS = 2;
 
-// Only 1 sender because no upstream edm.
-constexpr uint32_t NUM_SENDER_CHANNELS = 1;
+// 4 buffer slots per channel for pipelining.
+constexpr std::array<size_t, NUM_SENDER_CHANNELS> SENDER_NUM_BUFFERS_ARRAY = {4, 4};
+constexpr std::array<size_t, NUM_RECEIVER_CHANNELS> RECEIVER_NUM_BUFFERS_ARRAY = {4, 4};
 
-constexpr std::array<size_t, NUM_SENDER_CHANNELS> SENDER_NUM_BUFFERS_ARRAY = {2};
-
-constexpr std::array<size_t, NUM_RECEIVER_CHANNELS> RECEIVER_NUM_BUFFERS_ARRAY = {2};
-
-static_assert(NUM_SENDER_CHANNELS == 1);
+static_assert(NUM_SENDER_CHANNELS == 2);
 
 // Alignment for read and write to work on all core types.
 constexpr uint32_t GLOBAL_ALIGNMENT = 64;
