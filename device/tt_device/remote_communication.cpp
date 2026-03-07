@@ -4,6 +4,8 @@
 
 #include "umd/device/tt_device/remote_communication.hpp"
 
+#include <algorithm>
+
 #include <tt-logger/tt-logger.hpp>
 
 #include "assert.hpp"
@@ -41,6 +43,9 @@ void RemoteCommunication::set_remote_transfer_ethernet_cores(
     // This overrides the default ethernet cores tagged for host to cluster routing in the constructor and must be
     // called for all MMIO devices, if default behaviour is not desired.
     remote_transfer_eth_cores_.assign(remote_transfer_eth_cores.begin(), remote_transfer_eth_cores.end());
+    std::sort(remote_transfer_eth_cores_.begin(), remote_transfer_eth_cores_.end(), [](const tt_xy_pair& lhs, const tt_xy_pair& rhs) {
+        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+    });
 }
 
 TTDevice* RemoteCommunication::get_local_device() { return local_tt_device_; }

@@ -69,6 +69,7 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     const std::unordered_set<tt_xy_pair>& cores) {
     RemoteCommunication::set_remote_transfer_ethernet_cores(cores);
     write_reg_sender_indices_.clear();
+    active_eth_core_idx = 0;
 
     if (cores.empty()) {
         host_interface.init();
@@ -88,7 +89,7 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     //      between our read (1) and write (1), d2h will have advanced.
     //   3. Re-read d2h and write h2d = d2h again to catch any d2h advance.
     // After two passes the FW sees h2d == d2h and has no phantom to process.
-    tt_xy_pair eth_core = *cores.begin();
+    tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
     CoreCoord cc(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
     const uint32_t h2d_device_addr =
         host_interface.host_interface_on_device_addr + offsetof(decltype(host_interface), h2d);
@@ -117,31 +118,37 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
 
     host_interface.read_event_counter = 0;
 
-    // Also sync ch1 h2d with device d2h (read response channel).
-    {
-        uint32_t ch1_dev_iface_word = 0;
-        host_interface.tt_device->read_from_device(
-            &ch1_dev_iface_word, cc, host_interface.receiver_host_interface_on_device_addr, sizeof(ch1_dev_iface_word));
-        uint8_t ch1_d2h_receiver = (ch1_dev_iface_word >> 8) & 0xFF;
-        host_interface.recv_ch1.receiver_host_read_index = ch1_d2h_receiver;
-        host_interface.recv_ch1.d2h_receiver_index = ch1_d2h_receiver;
-        // Flush ch1 h2d to device (sender=0, receiver=synced).
-        host_interface.flush_recv_ch1_h2d(cc);
-    }
+    // Ch1 is a shared MMIO response ring.  Preserve the active core's current
+    // receiver position when the ring is already in sync, but if a previous
+    // tunnel user left unread responses behind (d2h != h2d), drop those stale
+    // slots by advancing h2d to d2h before the new tunnel starts reading.
+    //
+    // Without this, a newly bound 3-hop chip can inherit an old response slot:
+    // the first read sees a stale event (e.g. 119 > 0), and retries keep
+    // polling the old h2d slot even though the device has already advanced.
+    uint32_t ch1_d2h_word = 0;
+    host_interface.tt_device->read_from_device(
+        &ch1_d2h_word, cc, host_interface.receiver_host_interface_on_device_addr, sizeof(ch1_d2h_word));
+    uint32_t ch1_h2d_word = 0;
+    host_interface.tt_device->read_from_device(
+        &ch1_h2d_word,
+        cc,
+        host_interface.receiver_host_interface_on_device_addr + offsetof(decltype(host_interface), h2d),
+        sizeof(ch1_h2d_word));
+    uint8_t ch1_d2h_receiver = (ch1_d2h_word >> 8) & 0xFF;
+    uint8_t ch1_h2d_receiver = (ch1_h2d_word >> 8) & 0xFF;
+    host_interface.recv_ch1.receiver_host_read_index =
+        (ch1_d2h_receiver == ch1_h2d_receiver) ? ch1_h2d_receiver : ch1_d2h_receiver;
+    host_interface.recv_ch1.d2h_receiver_index = ch1_d2h_receiver;
+    host_interface.flush_recv_ch1_h2d(cc);
 
-    // Clear stale read event values in all ch1 receiver buffer slots on the MMIO ETH core.
-    // When a channel is re-bound to a new remote chip (e.g. a 2-hop chip sharing the
-    // same MMIO ETH channel as a 1-hop chip), the receiver buffer headers may contain
-    // read event IDs from prior reads by the previous chip.  The new chip starts with
-    // read_event_counter=0 and would see stale event > 0, triggering
-    // "Read event out of order".  Writing 0xdeadbeef (the "no event" sentinel, same as
-    // firmware init in channel_util.hpp) prevents this.
+    // Clear stale read event values in all ch1 receiver buffer slots on the
+    // active MMIO ETH core.  This keeps per-chip event counters independent
+    // without disturbing the shared ring's current write/read position.
     for (size_t slot = 0; slot < lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[1]; slot++) {
-        uint32_t slot_addr = host_interface.receiver_channel_base +
-            slot * lite_fabric::CHANNEL_BUFFER_SIZE;
-        uint32_t event_offset = slot_addr +
-            offsetof(lite_fabric::FabricLiteHeader, command_fields) +
-            offsetof(lite_fabric::NocReadCommandHeader, event);
+        uint32_t slot_addr = host_interface.receiver_channel_base + slot * lite_fabric::CHANNEL_BUFFER_SIZE;
+        uint32_t event_offset = slot_addr + offsetof(lite_fabric::FabricLiteHeader, command_fields) +
+                                offsetof(lite_fabric::NocReadCommandHeader, event);
         uint64_t sentinel = 0xdeadbeef;
         host_interface.tt_device->write_to_device(&sentinel, cc, event_offset, sizeof(sentinel));
     }

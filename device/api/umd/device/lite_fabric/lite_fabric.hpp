@@ -148,7 +148,8 @@ struct LiteFabricConfig {
         // initial_wr_idx + padding to keep struct sizes identical.
         uint8_t initial_wr_idx = 0;
         uint8_t is_reverse_relay = 0;
-        uint8_t _forwarding_pad[14]{};
+        volatile uint8_t active_txq_request = 0;
+        uint8_t _forwarding_pad[13]{};
     } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 
