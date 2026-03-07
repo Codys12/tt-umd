@@ -788,32 +788,14 @@ private:
         header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event_counter}, size);
         header.unaligned_offset = 0;
 
-        // Ch1 receiver self-healing: sync recv_ch1.receiver_host_read_index
-        // from ch1 device d2h to ensure we poll the correct receiver buffer
-        // slot.  Multiple HostToLiteFabricInterfaces sharing the same MMIO ETH
-        // core can desync the receiver index during Phase 2b multi-hop discovery.
-        {
-            DeviceToHost ch1_d2h{};
-            tt_device->read_from_device(
-                &ch1_d2h,
-                receiver_core,
-                receiver_host_interface_on_device_addr + offsetof(HostToLiteFabricInterface, d2h),
-                sizeof(ch1_d2h));
-            recv_ch1.d2h_receiver_index = ch1_d2h.fabric_receiver_channel_index;
-            if (recv_ch1.receiver_host_read_index != recv_ch1.d2h_receiver_index) {
-                log_warning(
-                    LogUMD,
-                    "read_one_page: ch1 receiver self-healing on core ({},{}) — "
-                    "syncing recv_ch1 {} -> d2h.receiver {}",
-                    receiver_core.x,
-                    receiver_core.y,
-                    recv_ch1.receiver_host_read_index,
-                    recv_ch1.d2h_receiver_index);
-                recv_ch1.receiver_host_read_index = recv_ch1.d2h_receiver_index;
-            }
-        }
-
         // Read responses arrive on ch1 receiver buffers.
+        // recv_ch1.receiver_host_read_index is tracked locally and always
+        // correct for the current interface.  Re-syncing from device d2h is
+        // handled by set_remote_transfer_ethernet_cores when channels are
+        // rebound.  Reading d2h here was harmful: the FW's d2h.receiver lags
+        // behind recv_ch1 due to the flow control gate ((d2h+1)%N != h2d),
+        // causing the self-healing to regress recv_ch1 and poll the wrong
+        // buffer slot (stale 0xdeadbeef sentinel → 10s timeout).
         uint32_t receiver_header_address = get_next_ch1_receiver_buffer_slot_address();
         log_debug(
             LogUMD,
