@@ -46,8 +46,11 @@ public:
     // After a binding change, the new core's d2h may differ from the host's
     // accumulated h2d, causing wait_for_all_writes_consumed to deadlock.
     void set_remote_transfer_ethernet_cores(const std::unordered_set<tt_xy_pair>& cores) override;
+    void resync_remote_transfer_ethernet_cores() override;
 
 private:
+    void sync_host_interface_state(bool sync_sender_state);
+
     lite_fabric::HostToLiteFabricInterface<lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0], lite_fabric::CHANNEL_BUFFER_SIZE>
         host_interface;
 

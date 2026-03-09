@@ -67,6 +67,10 @@ public:
     // The cores should be in translated coordinates.
     virtual void set_remote_transfer_ethernet_cores(const std::unordered_set<tt_xy_pair>& cores);
 
+    // Re-apply the current binding so implementations can resync any cached
+    // host/device channel state without changing channel selection.
+    virtual void resync_remote_transfer_ethernet_cores();
+
     TTDevice* get_local_device();
 
     // Get the active eth core that will be used for the next remote communication.

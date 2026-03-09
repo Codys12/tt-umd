@@ -157,15 +157,18 @@ static_assert(sizeof(LiteFabricConfig) % 16 == 0);
 static_assert(offsetof(LiteFabricConfig, primary_local_handshake) % 16 == 0);
 static_assert(offsetof(LiteFabricConfig, neighbour_handshake) % 16 == 0);
 
-// Deprecated: was a global static counter shared across all devices, which caused a race
-// condition when multiple remote devices performed concurrent reads (e.g. during parallel
-// build_and_init in Phase 3).  Each HostToLiteFabricInterface now has its own counter.
+// Shared read-event allocator for the MMIO-side ch1 response path.  Multiple
+// HostToLiteFabricInterfaces can reuse the same MMIO ETH core over time, and
+// delayed responses from an earlier interface must remain < the next interface's
+// expected event so they can be ignored instead of tripping "out of order".
 class HostToLiteFabricReadEvent {
 private:
     inline static std::atomic<uint64_t> event{0};
 
 public:
     static uint64_t get() { return event.load(); }
+
+    static uint64_t next() { return event.fetch_add(1); }
 
     static void increment() { event.fetch_add(1); }
 };
@@ -211,9 +214,9 @@ struct HostToLiteFabricInterface {
     // write_one_page, and read_one_page to set routing_fields in the header.
     uint32_t num_hops = 1;
 
-    // Per-instance read event counter.  Each HostToLiteFabricInterface (one per
-    // lite-fabric tunnel / remote device) tracks its own monotonic event ID so
-    // concurrent reads on different tunnels cannot interfere with each other.
+    // Cached "next expected" read event for this interface.  The actual event
+    // IDs are allocated from HostToLiteFabricReadEvent so interfaces that share
+    // one MMIO ETH core never restart at 0 and collide with delayed responses.
     uint64_t read_event_counter = 0;
 
     // Ch1 host interface device address (for receiver h2d flushing).
@@ -591,12 +594,11 @@ private:
         } while ((h2d.sender_host_write_index + 1) % NUM_BUFFERS == d2h.fabric_sender_channel_index);
     }
 
-    void wait_for_read_event(CoreCoord translated_core_sender, uint32_t read_event_addr) {
+    void wait_for_read_event(CoreCoord translated_core_sender, uint32_t read_event_addr, uint64_t expectedOrderId) {
         static constexpr auto k_Timeout = std::chrono::seconds(10);
         tt_driver_atomics::mfence();
         volatile FabricLiteHeader header;
         header.command_fields.noc_read.event = 0;
-        const auto expectedOrderId = read_event_counter;
         auto start = std::chrono::steady_clock::now();
         int poll_count = 0;
         while (true) {
@@ -680,7 +682,7 @@ private:
             }
         };
 
-        ++read_event_counter;
+        read_event_counter = expectedOrderId + 1;
     }
 
     void send_payload_flush_non_blocking_from_address(
@@ -784,9 +786,11 @@ private:
     }
 
     void read_one_page(void* mem_ptr, size_t size, CoreCoord receiver_core, uint64_t src_noc_addr) {
+        const auto read_event = lite_fabric::HostToLiteFabricReadEvent::next();
+        read_event_counter = read_event;
         FabricLiteHeader header;
         header.to_chip_unicast(num_hops);
-        header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event_counter}, size);
+        header.to_noc_read(lite_fabric::NocReadCommandHeader{src_noc_addr, read_event}, size);
         header.unaligned_offset = 0;
 
         // Read responses arrive on ch1 receiver buffers.
@@ -814,7 +818,7 @@ private:
         send_payload_flush_non_blocking_from_address(header, receiver_core, sender_channel_base);
 
         // Wait for response on ch1 receiver.
-        wait_for_read_event(receiver_core, receiver_header_address);
+        wait_for_read_event(receiver_core, receiver_header_address, read_event);
 
         uint8_t read_back_unaligned_offset = 0;
         tt_device->read_from_device(

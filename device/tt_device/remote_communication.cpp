@@ -48,6 +48,17 @@ void RemoteCommunication::set_remote_transfer_ethernet_cores(
     });
 }
 
+void RemoteCommunication::resync_remote_transfer_ethernet_cores() {
+    if (remote_transfer_eth_cores_.empty()) {
+        return;
+    }
+    int saved_active_eth_core_idx = active_eth_core_idx;
+    std::unordered_set<tt_xy_pair> cores(remote_transfer_eth_cores_.begin(), remote_transfer_eth_cores_.end());
+    set_remote_transfer_ethernet_cores(cores);
+    active_eth_core_idx =
+        std::min(saved_active_eth_core_idx, static_cast<int>(remote_transfer_eth_cores_.size()) - 1);
+}
+
 TTDevice* RemoteCommunication::get_local_device() { return local_tt_device_; }
 
 tt_xy_pair RemoteCommunication::get_remote_transfer_ethernet_core() {

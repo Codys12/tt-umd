@@ -3,6 +3,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <algorithm>
+
 #include "umd/device/tt_device/remote_communication_lite_fabric.hpp"
 
 namespace tt::umd {
@@ -18,13 +20,14 @@ void RemoteCommunicationLiteFabric::read_non_mmio(
     uint64_t core_src,
     uint32_t size_in_bytes,
     const std::chrono::milliseconds timeout_ms) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
     tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
     CoreCoord core_coord = CoreCoord(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
-    log_info(
-        LogUMD,
-        "read_non_mmio: target=({},{}) src={:#x} size={} via eth=({},{}) event={}",
-        target_core.x, target_core.y, core_src, size_in_bytes,
-        eth_core.x, eth_core.y, host_interface.read_event_counter);
+    // log_info(
+    //     LogUMD,
+    //     "read_non_mmio: target=({},{}) src={:#x} size={} via eth=({},{}) event={}",
+    //     target_core.x, target_core.y, core_src, size_in_bytes,
+    //     eth_core.x, eth_core.y, host_interface.read_event_counter);
     host_interface.read(dest, size_in_bytes, core_coord, target_core, core_src);
 }
 
@@ -36,6 +39,7 @@ void RemoteCommunicationLiteFabric::write_to_non_mmio(
     bool broadcast,
     std::vector<int> broadcast_header,
     const std::chrono::milliseconds timeout_ms) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
     // hacking this to be void* from const void*
     // TODO: support const void* properly.
     tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
@@ -44,6 +48,7 @@ void RemoteCommunicationLiteFabric::write_to_non_mmio(
 }
 
 void RemoteCommunicationLiteFabric::wait_for_non_mmio_flush(const std::chrono::milliseconds timeout_ms) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
     // Block until the lite fabric sender channel on the MMIO ERISC1 has consumed all pending
     // write descriptors that the host has submitted.  This ensures that all prior
     // write_to_non_mmio() calls have been committed to the remote chip's L1/DRAM before
@@ -65,30 +70,12 @@ void RemoteCommunicationLiteFabric::set_num_hops(uint32_t num_hops) {
     host_interface.num_hops = num_hops;
 }
 
-void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
-    const std::unordered_set<tt_xy_pair>& cores) {
-    RemoteCommunication::set_remote_transfer_ethernet_cores(cores);
-    write_reg_sender_indices_.clear();
-    active_eth_core_idx = 0;
-
-    if (cores.empty()) {
+void RemoteCommunicationLiteFabric::sync_host_interface_state(bool sync_sender_state) {
+    if (remote_transfer_eth_cores_.empty()) {
         host_interface.init();
         return;
     }
 
-    // Sync host-side counters with the device's actual d2h state on the new
-    // core.  The firmware's d2h counter may be non-zero if the core was used
-    // by a prior binding (e.g. UMD topology discovery) or if the device L1
-    // retained stale values.  Setting h2d = d2h means "no pending writes",
-    // which prevents wait_for_all_writes_consumed from deadlocking on a
-    // stale mismatch.
-    //
-    // Double-sync protocol to close the TOCTOU race:
-    //   1. Read d2h from device, write h2d = d2h to device (clears stale h2d).
-    //   2. If the FW was mid-processing a phantom packet using the old stale h2d
-    //      between our read (1) and write (1), d2h will have advanced.
-    //   3. Re-read d2h and write h2d = d2h again to catch any d2h advance.
-    // After two passes the FW sees h2d == d2h and has no phantom to process.
     tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
     CoreCoord cc(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
     const uint32_t h2d_device_addr =
@@ -111,21 +98,18 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
             &host_interface.h2d, cc, h2d_device_addr, sizeof(host_interface.h2d));
     };
 
-    // Pass 1: clear stale h2d and close the race window for any in-flight phantom.
-    sync_h2d_with_device();
-    // Pass 2: re-read d2h in case the FW advanced it during pass 1.
-    sync_h2d_with_device();
+    if (sync_sender_state) {
+        // Double-sync closes the race where the FW consumes a stale slot
+        // between the first d2h read and the host h2d flush.
+        sync_h2d_with_device();
+        sync_h2d_with_device();
+    }
 
-    host_interface.read_event_counter = 0;
+    host_interface.read_event_counter = lite_fabric::HostToLiteFabricReadEvent::get();
 
-    // Ch1 is a shared MMIO response ring.  Preserve the active core's current
-    // receiver position when the ring is already in sync, but if a previous
-    // tunnel user left unread responses behind (d2h != h2d), drop those stale
-    // slots by advancing h2d to d2h before the new tunnel starts reading.
-    //
-    // Without this, a newly bound 3-hop chip can inherit an old response slot:
-    // the first read sees a stale event (e.g. 119 > 0), and retries keep
-    // polling the old h2d slot even though the device has already advanced.
+    // Ch1 is a shared MMIO response ring. Preserve the current receiver
+    // position when the ring is already in sync; otherwise advance to the
+    // device's d2h position so a new tunnel user drops stale unread slots.
     uint32_t ch1_d2h_word = 0;
     host_interface.tt_device->read_from_device(
         &ch1_d2h_word, cc, host_interface.receiver_host_interface_on_device_addr, sizeof(ch1_d2h_word));
@@ -142,9 +126,6 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     host_interface.recv_ch1.d2h_receiver_index = ch1_d2h_receiver;
     host_interface.flush_recv_ch1_h2d(cc);
 
-    // Clear stale read event values in all ch1 receiver buffer slots on the
-    // active MMIO ETH core.  This keeps per-chip event counters independent
-    // without disturbing the shared ring's current write/read position.
     for (size_t slot = 0; slot < lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[1]; slot++) {
         uint32_t slot_addr = host_interface.receiver_channel_base + slot * lite_fabric::CHANNEL_BUFFER_SIZE;
         uint32_t event_offset = slot_addr + offsetof(lite_fabric::FabricLiteHeader, command_fields) +
@@ -154,13 +135,48 @@ void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
     }
 }
 
+void RemoteCommunicationLiteFabric::set_remote_transfer_ethernet_cores(
+    const std::unordered_set<tt_xy_pair>& cores) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
+    std::unordered_set<tt_xy_pair> current_cores(remote_transfer_eth_cores_.begin(), remote_transfer_eth_cores_.end());
+    bool same_binding = current_cores == cores;
+    int saved_active_eth_core_idx = active_eth_core_idx;
+
+    RemoteCommunication::set_remote_transfer_ethernet_cores(cores);
+    write_reg_sender_indices_.clear();
+    active_eth_core_idx = remote_transfer_eth_cores_.empty()
+                              ? 0
+                              : same_binding
+                                    ? std::min(saved_active_eth_core_idx, static_cast<int>(remote_transfer_eth_cores_.size()) - 1)
+                                    : 0;
+
+    if (cores.empty()) {
+        host_interface.init();
+        return;
+    }
+
+    // Only sync sender h2d/d2h from device state when the binding actually
+    // changes. Re-applying the same binding is handled by
+    // resync_remote_transfer_ethernet_cores(), which forces sender/ch1 state
+    // refresh when another remote device has used the same MMIO ETH core.
+    sync_host_interface_state(!same_binding);
+}
+
+void RemoteCommunicationLiteFabric::resync_remote_transfer_ethernet_cores() {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
+    write_reg_sender_indices_.clear();
+    sync_host_interface_state(true);
+}
+
 void RemoteCommunicationLiteFabric::write_remote_reg(uint32_t reg_addr, uint32_t reg_value) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
     tt_xy_pair eth_core = get_remote_transfer_ethernet_core();
     CoreCoord core_coord = CoreCoord(eth_core.x, eth_core.y, CoreType::ETH, CoordSystem::NOC0);
     host_interface.write_reg(reg_addr, reg_value, core_coord);
 }
 
 void RemoteCommunicationLiteFabric::write_remote_reg(uint32_t reg_addr, uint32_t reg_value, tt_xy_pair sender_core) {
+    auto lock = lock_manager_.acquire_mutex(MutexType::NON_MMIO, local_tt_device_->get_communication_device_id());
     // If sender_core is the same as the default remote transfer core, use the
     // regular h2d counter.  The save/restore path below flushes a separate h2d
     // value to the device's L1; when that happens on the same physical channel
